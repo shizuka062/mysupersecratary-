@@ -4173,32 +4173,73 @@ async def utak_auto_sync(context):
             await page.fill('input[type=password]', UTAK_PASSWORD)
             await page.click('button:has-text("Log in")')
             await asyncio.sleep(8)
-            # Close any modal/dialog that may appear after login
-            for _ in range(3):
-                try:
-                    dialog = page.locator('.MuiDialog-root')
-                    if await dialog.count() > 0:
+            results = []
+
+            async def _dismiss_modals():
+                """Close any MUI dialog/modal that blocks clicks.
+                Some UTAK popups ignore the Escape key, so this tries a
+                close/OK button first, then Escape, then the backdrop."""
+                close_selectors = [
+                    # UTAK "STORE READINESS / Welcome" onboarding popup uses an
+                    # aria-label="close" X button and ignores the Escape key.
+                    '.MuiDialog-root button[aria-label="close"]',
+                    '.MuiDialog-root button[aria-label="Close"]',
+                    'button[aria-label="close"]',
+                    'button[aria-label="Close"]',
+                    'button[aria-label="閉じる"]',
+                    '.MuiDialog-root button:has-text("OK")',
+                    '.MuiDialog-root button:has-text("Close")',
+                    '.MuiDialog-root button:has-text("Got it")',
+                    '.MuiDialog-root button:has-text("Dismiss")',
+                    '.MuiDialog-root button:has-text("Skip")',
+                    '.MuiDialog-root button:has-text("Later")',
+                    '.MuiDialog-root button:has-text("閉じる")',
+                    '.MuiDialog-root button:has-text("後で")',
+                    '.MuiDialog-root button:has-text("スキップ")',
+                ]
+                for _ in range(6):
+                    try:
+                        if await page.locator('.MuiDialog-root').count() == 0:
+                            return
+                    except Exception:
+                        return
+                    acted = False
+                    for sel in close_selectors:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.count() > 0 and await btn.is_visible():
+                                await btn.click(timeout=2000)
+                                await asyncio.sleep(1)
+                                acted = True
+                                break
+                        except Exception:
+                            continue
+                    if acted:
+                        continue
+                    try:
                         await page.keyboard.press('Escape')
                         await asyncio.sleep(1)
-                except Exception:
-                    break
-            results = []
-            async def _dismiss_modals():
-                """Close any MUI dialog/modal that blocks clicks."""
-                for _ in range(5):
-                    try:
-                        if await page.locator('.MuiDialog-root').count() > 0:
-                            await page.keyboard.press('Escape')
-                            await asyncio.sleep(1)
-                        else:
-                            break
                     except Exception:
-                        break
+                        pass
+                    try:
+                        backdrop = page.locator('.MuiBackdrop-root').first
+                        if await backdrop.count() > 0:
+                            await backdrop.click(timeout=2000, position={'x': 5, 'y': 5})
+                            await asyncio.sleep(1)
+                    except Exception:
+                        pass
+
+            # Close any modal/dialog that may appear after login
+            await _dismiss_modals()
 
             # Download Inventory CSV
             try:
                 await _dismiss_modals()
-                await page.click('a[href="/inventory"]')
+                try:
+                    await page.click('a[href="/inventory"]', timeout=15000)
+                except Exception:
+                    # Modal may still be blocking — navigate by URL directly
+                    await page.goto('https://utak.io/inventory', timeout=30000)
                 await asyncio.sleep(6)
                 await _dismiss_modals()
                 async with page.expect_download(timeout=30000) as dl_info:
@@ -4218,7 +4259,10 @@ async def utak_auto_sync(context):
             # Download Transactions CSV (set date to yesterday)
             try:
                 await _dismiss_modals()
-                await page.click('a[href="/transactions"]')
+                try:
+                    await page.click('a[href="/transactions"]', timeout=15000)
+                except Exception:
+                    await page.goto('https://utak.io/transactions', timeout=30000)
                 await asyncio.sleep(6)
                 await _dismiss_modals()
                 # Set date range to yesterday (since sync runs at 01:00)
