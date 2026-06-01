@@ -1180,13 +1180,18 @@ def parse_report(text: str) -> dict:
         raw_line = m.group(1).strip()
         # Extract just the date token — handles /, -, . separators and month names
         date_extract = re.search(
-            r'(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4}'
-            r'|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2}'
+            r'(\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{4}'
+            r'|\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2}'
             r'|\d{4}-\d{2}-\d{2}'
             r'|[A-Za-z]+\.?\s+\d{1,2},?\s*\d{4})',
             raw_line, re.IGNORECASE
         )
         raw_date = date_extract.group(1).strip() if date_extract else raw_line
+        # Strip accidental whitespace around /-. in numeric dates
+        # (e.g. "05/ 31 /2026" -> "05/31/2026") so strptime can parse them.
+        # Skip month-name formats — those intentionally contain spaces.
+        if re.match(r'^\s*\d', raw_date):
+            raw_date = re.sub(r'\s*([/\-.])\s*', r'\1', raw_date)
         today = datetime.now()
         # Smart MM/DD vs DD/MM disambiguation for slash-separated dates:
         # when both interpretations are valid (e.g. 03/10/2026), pick the one
