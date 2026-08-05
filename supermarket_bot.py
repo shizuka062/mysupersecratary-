@@ -966,6 +966,44 @@ def get_monthly_report(chat_id: int, year: int, month: int) -> dict:
         'weekday': weekday, 'daily': daily, 'dead': dead[:10],
     }
 
+def get_reconcile_month(chat_id: int, year: int, month: int) -> dict:
+    """日次売上レポート(supermarket_sales)とPOS明細(utak_sales)を日ごとに突き合わせる。
+    差の出方から、税込/税抜などの systematic な差か、手集計のブレかを判定する材料を返す。"""
+    # ① 日次レポート（日ごと合計）
+    records, _, _ = get_month_records(chat_id, year, month)
+    rep = {}
+    for r in records:
+        dt = str(r.get('date'))[:10]
+        rep[dt] = rep.get(dt, 0) + (r.get('total', 0) or 0)
+    # ② POS明細（日ごと gross_price 合計・店頭＋オンライン全て）
+    ucid = resolve_utak_chat(chat_id)
+    pat = f"{year:04d}-{month:02d}-%"
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""SELECT sale_date, COALESCE(SUM(gross_price), 0)
+                 FROM utak_sales WHERE chat_id=? AND sale_date LIKE ?
+                 GROUP BY sale_date""", (ucid, pat))
+    pos = {row[0]: (row[1] or 0) for row in c.fetchall()}
+    conn.close()
+
+    dates = sorted(set(rep) | set(pos))
+    rows, ratios = [], []
+    for dt in dates:
+        a, b = rep.get(dt, 0), pos.get(dt, 0)
+        ratio = (b / a) if a > 0 and b > 0 else None
+        if ratio:
+            ratios.append(ratio)
+        rows.append({'date': dt, 'rep': a, 'pos': b, 'diff': b - a, 'ratio': ratio})
+    t1, t2 = sum(rep.values()), sum(pos.values())
+    return {
+        'month': f"{year:04d}-{month:02d}", 'rows': rows,
+        'total_rep': t1, 'total_pos': t2, 'gap': t2 - t1,
+        'gap_pct': ((t2 - t1) / t1 * 100) if t1 else 0,
+        'ratios': ratios,
+        'missing_rep': [d for d in pos if d not in rep and pos[d] > 0],  # POSにあり日次に無い日
+        'missing_pos': [d for d in rep if d not in pos and rep[d] > 0],  # 日次にありPOSに無い日
+    }
+
 def get_utak_inventory_summary(chat_id: int) -> str:
     """最新UTAKインベントリのカテゴリ別サマリーをテキストで返す。"""
     conn = get_conn()
@@ -3501,6 +3539,8 @@ def detect_intent(text: str) -> Optional[str]:
         return 'bundle_suggestions'
     if any(k in t for k in ['レシート', 'receipt', '来店数', '来店客', '客数', '客足', '来客', 'foot traffic', 'footfall']):
         return 'receipt_trend'
+    if any(k in t for k in ['照合', 'reconcile', '突き合わせ', '突合', 'すり合わせ', 'つき合わせ']):
+        return 'reconcile'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -3772,6 +3812,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'hourly_sales':            await cmd_hourly_sales(update, ctx)
     elif intent == 'bundle_suggestions':      await cmd_bundle_suggestions(update, ctx)
     elif intent == 'receipt_trend':           await cmd_receipt_trend(update, ctx)
+    elif intent == 'reconcile':               await cmd_reconcile(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
@@ -4385,6 +4426,64 @@ async def cmd_receipt_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append("\n💡 広告を出した期間と出していない期間で「件/日」を比べると、"
                  "広告で来店が増えたかが分かります。")
     sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_reconcile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """日次売上レポートとPOS明細を日ごとに突き合わせ、差の原因を切り分ける。「照合 2026-07」等。"""
+    chat_id = update.effective_chat.id
+    text = (update.message.text or '') if update.message else ''
+    now = datetime.now(PHT)
+    m_iso = re.search(r'(20\d{2})[-/](\d{1,2})', text)
+    m_jp = re.search(r'(\d{1,2})\s*月', text)
+    if '先月' in text:
+        prev = now.replace(day=1) - timedelta(days=1)
+        year, month = prev.year, prev.month
+    elif m_iso:
+        year, month = int(m_iso.group(1)), int(m_iso.group(2))
+    elif m_jp:
+        year, month = now.year, int(m_jp.group(1))
+    else:
+        year, month = now.year, now.month
+    if not (1 <= month <= 12):
+        sent = await update.message.reply_text("📅 月の指定が正しくありません（例：照合 2026-07）。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+
+    d = get_reconcile_month(chat_id, year, month)
+    if not d['rows']:
+        sent = await update.message.reply_text(f"📅 {d['month']} の照合データがありません。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+
+    # 日ごとの表
+    b1 = [f"🔍 売上照合 — {d['month']}\n①日次レポート ②POS明細 差 倍率\n━━━━━━━━━━━━━━━━━━━"]
+    for r in d['rows']:
+        ratio_s = f"×{r['ratio']:.2f}" if r['ratio'] else "—"
+        b1.append(f"{r['date'][5:]}  ①₱{r['rep']:,.0f}  ②₱{r['pos']:,.0f}  差₱{r['diff']:+,.0f}  {ratio_s}")
+    sent = await update.message.reply_text("\n".join(b1))
+    save_bot_message(chat_id, sent.message_id)
+
+    # サマリー＋判定
+    b2 = [f"📊 照合サマリー — {d['month']}\n━━━━━━━━━━━━━━━━━━━"]
+    b2.append(f"① 日次レポート 合計: ₱{d['total_rep']:,.0f}")
+    b2.append(f"② POS明細 合計:      ₱{d['total_pos']:,.0f}")
+    b2.append(f"差（②−①）:          ₱{d['gap']:+,.0f}（{d['gap_pct']:+.1f}%）")
+    if d['missing_pos']:
+        b2.append(f"\n⚠️ 日次にありPOSに無い日: {len(d['missing_pos'])}日 → {', '.join(x[5:] for x in d['missing_pos'][:8])}")
+    if d['missing_rep']:
+        b2.append(f"⚠️ POSにあり日次に無い日: {len(d['missing_rep'])}日 → {', '.join(x[5:] for x in d['missing_rep'][:8])}")
+    if d['ratios']:
+        rmin, rmax = min(d['ratios']), max(d['ratios'])
+        ravg = sum(d['ratios']) / len(d['ratios'])
+        b2.append(f"\n📐 倍率(②÷①): 平均×{ravg:.2f}（範囲 ×{rmin:.2f}〜×{rmax:.2f}）")
+        if (rmax - rmin) <= 0.15:
+            b2.append("→ 毎日ほぼ一定の倍率。税込/税抜など『決まった差』が濃厚。"
+                      "①か②に補正をかければ売上を確定できます。")
+        else:
+            b2.append("→ 日によって倍率がバラバラ。日次レポート(手集計)のブレの可能性。"
+                      "自動記録のPOS(②)の方が正確な傾向。")
+    b2.append("\n💡 一定倍率なら税(VAT12%)等を疑い、バラつきなら日次の付け漏れを疑います。")
+    sent = await update.message.reply_text("\n".join(b2))
     save_bot_message(chat_id, sent.message_id)
 
 # ─── UTAK auto-sync job ───────────────────────────────────
