@@ -849,6 +849,22 @@ def get_daily_sales_report(chat_id: int, target_date: str = None) -> str:
 
     return "\n".join(lines)
 
+def resolve_utak_chat(chat_id: int) -> int:
+    """utak_salesデータが入っているchat_idを返す。現在のchatに無ければ、
+    最もデータの多いchat（＝自動同期の保存先）にフォールバックする。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM utak_sales WHERE chat_id=?", (chat_id,))
+    if (c.fetchone()[0] or 0) > 0:
+        conn.close()
+        return chat_id
+    c.execute("SELECT chat_id FROM utak_sales GROUP BY chat_id ORDER BY COUNT(*) DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID or chat_id
+
 def get_receipt_trend(chat_id: int, days: int = 14) -> list[dict]:
     """日次のレシート枚数（＝会計回数＝来店客数の代理指標）と売上・客単価の推移を返す。
     広告を出した期間と出していない期間の来店比較に使う。"""
@@ -3085,7 +3101,7 @@ async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _send_monthly_pos_detail(update: Update, chat_id: int, year: int, month: int):
     """月次レポートにPOS明細(utak_sales)の来店数・商品ランキング・死に筋・曜日別を追記。
     データを送信したらTrue、POSデータが無ければFalseを返す。"""
-    d = get_monthly_report(chat_id, year, month)
+    d = get_monthly_report(resolve_utak_chat(chat_id), year, month)
     if d.get('days_with_data', 0) == 0:
         return False
     def pct(x, base):
@@ -4347,7 +4363,7 @@ async def cmd_receipt_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = re.search(r'(\d{1,3})\s*日', text) or re.search(r'(\d{1,3})\s*days?', text.lower())
     days = int(m.group(1)) if m else 14
     days = max(1, min(days, 120))
-    trend = get_receipt_trend(chat_id, days=days)
+    trend = get_receipt_trend(resolve_utak_chat(chat_id), days=days)
     if not trend:
         sent = await update.message.reply_text(
             "🧾 レシートデータがありません。UTAKのTransactions CSVが同期されると表示されます。")
