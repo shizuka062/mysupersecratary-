@@ -806,11 +806,26 @@ def get_daily_sales_report(chat_id: int, target_date: str = None) -> str:
               (chat_id, target_date))
     cashiers = c.fetchall()
 
+    # Total receipts (paying customers) + total sales for the day
+    c.execute("""SELECT COUNT(DISTINCT transaction_id) FROM utak_sales
+                 WHERE chat_id=? AND sale_date=? AND transaction_id != ''""",
+              (chat_id, target_date))
+    receipt_count = c.fetchone()[0] or 0
+    c.execute("""SELECT COALESCE(SUM(gross_price), 0) FROM utak_sales
+                 WHERE chat_id=? AND sale_date=? AND transaction_id != ''""",
+              (chat_id, target_date))
+    day_sales = c.fetchone()[0] or 0
+
     conn.close()
 
     # Build report
     weekday = target_dt.strftime('%A')
     lines = [f"📊 Daily Product Insights — {target_date} ({weekday})\n━━━━━━━━━━━━━━━━━━━"]
+
+    if receipt_count:
+        avg_basket = day_sales / receipt_count if receipt_count else 0
+        basket_str = f"  |  Avg ₱{avg_basket:,.0f}/receipt" if avg_basket else ""
+        lines.append(f"\n🧾 Receipts (customers): {receipt_count}{basket_str}")
 
     if top_items:
         lines.append(f"\n🏆 Top 5 Sellers:")
@@ -833,6 +848,23 @@ def get_daily_sales_report(chat_id: int, target_date: str = None) -> str:
             lines.append(f"  • {name}: {txn_count} txns")
 
     return "\n".join(lines)
+
+def get_receipt_trend(chat_id: int, days: int = 14) -> list[dict]:
+    """日次のレシート枚数（＝会計回数＝来店客数の代理指標）と売上・客単価の推移を返す。
+    広告を出した期間と出していない期間の来店比較に使う。"""
+    since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""SELECT sale_date,
+                        COUNT(DISTINCT transaction_id) as receipts,
+                        COALESCE(SUM(gross_price), 0) as sales
+                 FROM utak_sales
+                 WHERE chat_id=? AND sale_date >= ? AND transaction_id != ''
+                 GROUP BY sale_date ORDER BY sale_date""", (chat_id, since))
+    rows = c.fetchall()
+    conn.close()
+    return [{'date': r[0], 'receipts': r[1], 'sales': r[2] or 0,
+             'avg': (r[2] / r[1]) if r[1] else 0} for r in rows]
 
 def get_utak_inventory_summary(chat_id: int) -> str:
     """最新UTAKインベントリのカテゴリ別サマリーをテキストで返す。"""
@@ -3301,6 +3333,8 @@ def detect_intent(text: str) -> Optional[str]:
         return 'hourly_sales'
     if any(k in t for k in ['セット販売', 'bundle', 'バンドル', '一緒に買', 'bought together', 'ペア']):
         return 'bundle_suggestions'
+    if any(k in t for k in ['レシート', 'receipt', '来店数', '来店客', '客数', '客足', '来客', 'foot traffic', 'footfall']):
+        return 'receipt_trend'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -3571,6 +3605,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'online_sales':            await cmd_online_sales(update, ctx)
     elif intent == 'hourly_sales':            await cmd_hourly_sales(update, ctx)
     elif intent == 'bundle_suggestions':      await cmd_bundle_suggestions(update, ctx)
+    elif intent == 'receipt_trend':           await cmd_receipt_trend(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
@@ -4151,6 +4186,38 @@ async def cmd_bundle_suggestions(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     for i, p in enumerate(pairs, 1):
         lines.append(f"{i}. {p['item_a']}\n   + {p['item_b']}\n   → {p['count']} times together")
     lines.append(f"\n💡 Consider bundle discounts for these pairs!")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_receipt_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """日次レシート枚数（来店客数の代理指標）の推移。広告の前後比較用。
+    メッセージ内に「30日」等があればその日数、無ければ14日。"""
+    chat_id = update.effective_chat.id
+    text = (update.message.text or '') if update.message else ''
+    m = re.search(r'(\d{1,3})\s*日', text) or re.search(r'(\d{1,3})\s*days?', text.lower())
+    days = int(m.group(1)) if m else 14
+    days = max(1, min(days, 120))
+    trend = get_receipt_trend(chat_id, days=days)
+    if not trend:
+        sent = await update.message.reply_text(
+            "🧾 レシートデータがありません。UTAKのTransactions CSVが同期されると表示されます。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    max_r = max(t['receipts'] for t in trend) or 1
+    total_r = sum(t['receipts'] for t in trend)
+    total_s = sum(t['sales'] for t in trend)
+    lines = [f"🧾 Daily Receipts / Foot Traffic (Past {days} Days)\n━━━━━━━━━━━━━━━━━━━"]
+    lines.append("レシート枚数＝会計回数＝来店客数の目安（買った人）\n")
+    for t in trend:
+        bar_len = int(t['receipts'] / max_r * 12) if max_r > 0 else 0
+        bar = '█' * bar_len + '░' * (12 - bar_len)
+        lines.append(f"{t['date']} {bar} {t['receipts']:>3}件  ₱{t['sales']:,.0f}")
+    avg_r = total_r / len(trend) if trend else 0
+    avg_basket = total_s / total_r if total_r else 0
+    lines.append(f"\n📊 合計 {total_r}件 ／ 平均 {avg_r:.0f}件/日")
+    lines.append(f"💰 平均客単価 ₱{avg_basket:,.0f}")
+    lines.append("\n💡 広告を出した期間と出していない期間で「件/日」を比べると、"
+                 "広告で来店が増えたかが分かります。")
     sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
 
