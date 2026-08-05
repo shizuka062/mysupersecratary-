@@ -2992,20 +2992,46 @@ async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     today = datetime.now()
-    records, month_start, month_end = get_month_records(chat_id)
-    month_label = today.strftime('%Y年%m月')
-    if not records:
-        sent = await update.message.reply_text(f"📭 {month_label}のデータがまだありません。")
+    # 月の指定（「月次 2026-07」「7月」「先月」）。無ければ今月。
+    msg_text = (update.message.text or '') if update.message else ''
+    m_iso = re.search(r'(20\d{2})[-/](\d{1,2})', msg_text)
+    m_jp = re.search(r'(\d{1,2})\s*月', msg_text)
+    if '先月' in msg_text:
+        prev = today.replace(day=1) - timedelta(days=1)
+        ry, rm = prev.year, prev.month
+    elif m_iso:
+        ry, rm = int(m_iso.group(1)), int(m_iso.group(2))
+    elif m_jp:
+        ry, rm = today.year, int(m_jp.group(1))
+    else:
+        ry, rm = today.year, today.month
+    if not (1 <= rm <= 12):
+        sent = await update.message.reply_text("📅 月の指定が正しくありません（例：月次 2026-07）。")
         save_bot_message(chat_id, sent.message_id)
+        return
+    is_current = (ry == today.year and rm == today.month)
+
+    records, month_start, month_end = get_month_records(chat_id, ry, rm)
+    month_label = f"{ry}年{rm:02d}月"
+    if not records:
+        # 日次レポートは無くても、POS明細(utak_sales)に当月データがあれば詳細だけ出す
+        posted = False
+        try:
+            posted = await _send_monthly_pos_detail(update, chat_id, ry, rm)
+        except Exception as e:
+            logger.error(f"monthly POS detail (no-records) failed: {e}")
+        if not posted:
+            sent = await update.message.reply_text(f"📭 {month_label}のデータがまだありません。")
+            save_bot_message(chat_id, sent.message_id)
         return
     total_sum      = sum(r['total'] for r in records)
     n              = len(records)
-    days_elapsed   = today.day
-    days_in_month  = calendar.monthrange(today.year, today.month)[1]
-    days_remaining = days_in_month - days_elapsed
-    projected      = (total_sum / days_elapsed * days_in_month) if days_elapsed > 0 else 0
+    days_in_month  = calendar.monthrange(ry, rm)[1]
+    days_elapsed   = today.day if is_current else days_in_month
+    days_remaining = max(days_in_month - days_elapsed, 0)
+    projected      = (total_sum / days_elapsed * days_in_month) if (is_current and days_elapsed > 0) else total_sum
     monthly_target = get_target_any(chat_id, 'monthly')
-    if monthly_target > 0:
+    if monthly_target > 0 and is_current:
         m_ach    = total_sum / monthly_target * 100
         m_filled = min(int(m_ach // 10), 10)
         m_bar    = "🟩" * m_filled + "⬜" * (10 - m_filled)
@@ -3032,12 +3058,13 @@ async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cat_block = f"\n\n【カテゴリ別売上】\n{cat_rows}"
     else:
         cat_block = ""
+    elapsed_str = f" / {days_elapsed}日経過" if is_current else ""
+    proj_str = f"\n📈 月末予測: ₱{projected:,.0f}" if is_current else ""
     text = f"""📅 月次レポート - {month_label}（{month_start} 〜 {month_end}）
 ━━━━━━━━━━━━━━━━━━━
 💰 月間売上合計: ₱{total_sum:,.0f}
 📊 日平均: ₱{total_sum/n:,.0f}
-📆 営業日数: {n}日 / {days_elapsed}日経過
-📈 月末予測: ₱{projected:,.0f}{target_block}{cat_block}"""
+📆 営業日数: {n}日{elapsed_str}{proj_str}{target_block}{cat_block}"""
     s1 = await update.message.reply_text(text)
     save_bot_message(chat_id, s1.message_id)
     s2 = await update.message.reply_photo(photo=make_trend_chart(records, f"Monthly Sales Trend ({month_label})"), caption="📈 Sales Trend")
@@ -3048,6 +3075,44 @@ async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if buf_cat.getbuffer().nbytes > 0:
         s4 = await update.message.reply_photo(photo=buf_cat, caption="🗂️ Category Breakdown")
         save_bot_message(chat_id, s4.message_id)
+
+    # ▼ POS明細ベースの詳細（来店数・商品TOP・死に筋・曜日別）を追記
+    try:
+        await _send_monthly_pos_detail(update, chat_id, ry, rm)
+    except Exception as e:
+        logger.error(f"monthly POS detail failed: {e}")
+
+async def _send_monthly_pos_detail(update: Update, chat_id: int, year: int, month: int):
+    """月次レポートにPOS明細(utak_sales)の来店数・商品ランキング・死に筋・曜日別を追記。
+    データを送信したらTrue、POSデータが無ければFalseを返す。"""
+    d = get_monthly_report(chat_id, year, month)
+    if d.get('days_with_data', 0) == 0:
+        return False
+    def pct(x, base):
+        return (x / base * 100) if base else 0
+    wlabels = [(1, '月'), (2, '火'), (3, '水'), (4, '木'), (5, '金'), (6, '土'), (0, '日')]
+    b1 = [f"🧾 POS明細の詳細 — {d['month']}\n━━━━━━━━━━━━━━━━━━━"]
+    b1.append(f"🧾 来店(レシート): {d['receipts']}件 / 平均 {d['avg_receipts_per_day']:.0f}件/日 / 客単価 ₱{d['avg_basket']:,.0f}")
+    b1.append(f"🏪 店頭 ₱{d['store_sales']:,.0f} ({pct(d['store_sales'], d['total_sales']):.0f}%)"
+              f"  📱 オンライン ₱{d['online_sales']:,.0f} ({pct(d['online_sales'], d['total_sales']):.0f}%)")
+    b1.append("📈 曜日別 平均売上:")
+    b1.append("  " + " / ".join(f"{lab} ₱{d['weekday'].get(i, {}).get('avg', 0):,.0f}" for i, lab in wlabels))
+    sent = await update.message.reply_text("\n".join(b1))
+    save_bot_message(chat_id, sent.message_id)
+
+    b2 = ["🏆 売れ筋TOP10（数量）"]
+    for i, (name, q, s) in enumerate(d['top_qty'], 1):
+        b2.append(f"  {i}. {name} ×{q:.0f} (₱{s:,.0f})")
+    b2.append("\n💵 売上TOP10（金額）")
+    for i, (name, s, q) in enumerate(d['top_rev'], 1):
+        b2.append(f"  {i}. {name} ₱{s:,.0f} (×{q:.0f})")
+    if d['dead']:
+        b2.append(f"\n😴 死に筋（在庫ありだが{d['month']}に未販売）")
+        for it in d['dead']:
+            b2.append(f"  • {it['item_name']} (在庫{it['stock']:.0f} / ₱{it['inv_value']:,.0f})")
+    sent = await update.message.reply_text("\n".join(b2))
+    save_bot_message(chat_id, sent.message_id)
+    return True
 
 async def cmd_compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str = 'payment'):
     chat_id = update.effective_chat.id
@@ -3339,7 +3404,8 @@ def detect_intent(text: str) -> Optional[str]:
         return 'last_week'
     if any(k in t for k in ['今週', 'weekly', 'ウィークリー', '週次', '週レポ']):
         return 'weekly'
-    if any(k in t for k in ['今月', 'monthly', 'マンスリー', '月次', '月レポ']):
+    if any(k in t for k in ['今月', 'monthly', 'マンスリー', '月次', '月レポ', '月報', '月間レポート', '先月']) \
+       or re.search(r'\d{1,2}\s*月の(売上|実績|分析|レポート|データ)', t):
         return 'monthly'
     if any(k in t for k in ['シフト比較', 'shift比較', 'shift compare', 'compare shift']):
         return 'compare_shift'
@@ -3419,9 +3485,6 @@ def detect_intent(text: str) -> Optional[str]:
         return 'bundle_suggestions'
     if any(k in t for k in ['レシート', 'receipt', '来店数', '来店客', '客数', '客足', '来客', 'foot traffic', 'footfall']):
         return 'receipt_trend'
-    if any(k in t for k in ['月次', '月報', 'monthly', '月間レポート', '先月の売上', '今月の売上']) \
-       or re.search(r'\d{1,2}\s*月の(売上|実績|分析|レポート|データ)', t):
-        return 'monthly_report'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -3693,7 +3756,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'hourly_sales':            await cmd_hourly_sales(update, ctx)
     elif intent == 'bundle_suggestions':      await cmd_bundle_suggestions(update, ctx)
     elif intent == 'receipt_trend':           await cmd_receipt_trend(update, ctx)
-    elif intent == 'monthly_report':          await cmd_monthly_report(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
@@ -4308,77 +4370,6 @@ async def cmd_receipt_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "広告で来店が増えたかが分かります。")
     sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
-
-async def cmd_monthly_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """指定月の店全体の月次分析。「月次 2026-07」「7月の売上」等。無指定なら前月。"""
-    chat_id = update.effective_chat.id
-    text = (update.message.text or '') if update.message else ''
-    now = datetime.now(PHT)
-    m_iso = re.search(r'(20\d{2})[-/](\d{1,2})', text)
-    m_jp = re.search(r'(\d{1,2})\s*月', text)
-    if m_iso:
-        year, month = int(m_iso.group(1)), int(m_iso.group(2))
-    elif m_jp:
-        year, month = now.year, int(m_jp.group(1))
-    else:
-        prev = now.replace(day=1) - timedelta(days=1)
-        year, month = prev.year, prev.month
-    if not (1 <= month <= 12):
-        sent = await update.message.reply_text("📅 月の指定が正しくありません（例：月次 2026-07）。")
-        save_bot_message(chat_id, sent.message_id)
-        return
-
-    d = get_monthly_report(chat_id, year, month)
-    if d.get('days_with_data', 0) == 0:
-        sent = await update.message.reply_text(f"📅 {d['month']} の売上データがありません。")
-        save_bot_message(chat_id, sent.message_id)
-        return
-
-    def pct(x, base):
-        return (x / base * 100) if base else 0
-
-    # ── Block 1: 概要・カテゴリ・オンライン・曜日 ──
-    b1 = [f"📅 月次レポート — {d['month']}\n━━━━━━━━━━━━━━━━━━━"]
-    b1.append(f"📆 データ日数: {d['days_with_data']}日")
-    b1.append(f"💰 総売上: ₱{d['total_sales']:,.0f}")
-    b1.append(f"   🏪 店頭 ₱{d['store_sales']:,.0f} ({pct(d['store_sales'], d['total_sales']):.0f}%)"
-              f"  📱 オンライン ₱{d['online_sales']:,.0f} ({pct(d['online_sales'], d['total_sales']):.0f}%)")
-    b1.append(f"🧾 来店(レシート): {d['receipts']}件 / 平均 {d['avg_receipts_per_day']:.0f}件/日 / 客単価 ₱{d['avg_basket']:,.0f}")
-    if d['store_cats']:
-        b1.append("\n🗂 カテゴリ別売上(店頭):")
-        for cat, s, q in d['store_cats'][:12]:
-            b1.append(f"  • {cat} ₱{s:,.0f} ({pct(s, d['store_sales']):.0f}%)")
-    if d['online_by_platform']:
-        b1.append("\n📱 オンライン内訳:")
-        for plat, s in sorted(d['online_by_platform'].items(), key=lambda x: x[1], reverse=True):
-            b1.append(f"  • {plat} ₱{s:,.0f}")
-    wlabels = [(1, '月'), (2, '火'), (3, '水'), (4, '木'), (5, '金'), (6, '土'), (0, '日')]
-    b1.append("\n📈 曜日別 平均売上:")
-    b1.append("  " + " / ".join(f"{lab} ₱{d['weekday'].get(i, {}).get('avg', 0):,.0f}" for i, lab in wlabels))
-
-    # ── Block 2: 売れ筋・死に筋 ──
-    b2 = ["🏆 売れ筋TOP10（数量）"]
-    for i, (name, q, s) in enumerate(d['top_qty'], 1):
-        b2.append(f"  {i}. {name} ×{q:.0f} (₱{s:,.0f})")
-    b2.append("\n💵 売上TOP10（金額）")
-    for i, (name, s, q) in enumerate(d['top_rev'], 1):
-        b2.append(f"  {i}. {name} ₱{s:,.0f} (×{q:.0f})")
-    if d['dead']:
-        b2.append(f"\n😴 死に筋（在庫ありだが{d['month']}に未販売）")
-        for it in d['dead']:
-            b2.append(f"  • {it['item_name']} (在庫{it['stock']:.0f} / ₱{it['inv_value']:,.0f})")
-
-    # ── Block 3: 日別推移 ──
-    b3 = [f"📅 日別売上（{d['month']}）"]
-    max_s = max((s for _, s, _ in d['daily']), default=1) or 1
-    for date, s, r in d['daily']:
-        bar_len = int(s / max_s * 10) if max_s > 0 else 0
-        bar = '█' * bar_len + '░' * (10 - bar_len)
-        b3.append(f"{date[5:]} {bar} ₱{s:,.0f} ({r}件)")
-
-    for block in ("\n".join(b1), "\n".join(b2), "\n".join(b3)):
-        sent = await update.message.reply_text(block)
-        save_bot_message(chat_id, sent.message_id)
 
 # ─── UTAK auto-sync job ───────────────────────────────────
 async def utak_auto_sync(context):
