@@ -866,6 +866,90 @@ def get_receipt_trend(chat_id: int, days: int = 14) -> list[dict]:
     return [{'date': r[0], 'receipts': r[1], 'sales': r[2] or 0,
              'avg': (r[2] / r[1]) if r[1] else 0} for r in rows]
 
+def get_monthly_report(chat_id: int, year: int, month: int) -> dict:
+    """指定した月（YYYY-MM）の店全体の売上分析。UTAK明細ベース。
+    総売上・来店数・売れ筋・カテゴリ別・曜日別・日別・死に筋・オンラインvs店頭を集計。"""
+    pat = f"{year:04d}-{month:02d}-%"
+    online_cats = ('GRABMART', 'GRABFOOD', 'FOODPANDA')
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(DISTINCT sale_date) FROM utak_sales WHERE chat_id=? AND sale_date LIKE ?",
+              (chat_id, pat))
+    days_with_data = c.fetchone()[0] or 0
+    if days_with_data == 0:
+        conn.close()
+        return {'month': f"{year:04d}-{month:02d}", 'days_with_data': 0}
+
+    # カテゴリ別（店頭/オンライン分類）
+    c.execute("""SELECT category, SUM(qty), SUM(gross_price)
+                 FROM utak_sales WHERE chat_id=? AND sale_date LIKE ?
+                 GROUP BY category""", (chat_id, pat))
+    store_cats, online_by_platform = [], {}
+    store_sales = online_sales = 0.0
+    for cat, qty, sales in c.fetchall():
+        sales = sales or 0
+        cu = (cat or '').upper().strip()
+        if any(cu.startswith(p) or cu == p for p in online_cats):
+            plat = cu.split()[0] if ' ' in cu else cu
+            online_by_platform[plat] = online_by_platform.get(plat, 0) + sales
+            online_sales += sales
+        else:
+            store_cats.append((cat, sales, qty or 0))
+            store_sales += sales
+    store_cats.sort(key=lambda x: x[1], reverse=True)
+    total_sales = store_sales + online_sales
+
+    c.execute("""SELECT COUNT(DISTINCT transaction_id) FROM utak_sales
+                 WHERE chat_id=? AND sale_date LIKE ? AND transaction_id != ''""", (chat_id, pat))
+    receipts = c.fetchone()[0] or 0
+
+    c.execute("""SELECT item_name, SUM(qty) q, SUM(gross_price) s
+                 FROM utak_sales WHERE chat_id=? AND sale_date LIKE ?
+                 GROUP BY item_name ORDER BY q DESC LIMIT 10""", (chat_id, pat))
+    top_qty = [(r[0], r[1] or 0, r[2] or 0) for r in c.fetchall()]
+    c.execute("""SELECT item_name, SUM(gross_price) s, SUM(qty) q
+                 FROM utak_sales WHERE chat_id=? AND sale_date LIKE ?
+                 GROUP BY item_name ORDER BY s DESC LIMIT 10""", (chat_id, pat))
+    top_rev = [(r[0], r[1] or 0, r[2] or 0) for r in c.fetchall()]
+
+    c.execute("""SELECT strftime('%w', sale_date) w, SUM(gross_price) s, COUNT(DISTINCT sale_date) d
+                 FROM utak_sales WHERE chat_id=? AND sale_date LIKE ? GROUP BY w""", (chat_id, pat))
+    weekday = {}
+    for w, s, d in c.fetchall():
+        weekday[int(w)] = {'sales': s or 0, 'days': d or 0, 'avg': ((s or 0) / d) if d else 0}
+
+    c.execute("""SELECT sale_date, SUM(gross_price) s, COUNT(DISTINCT transaction_id) r
+                 FROM utak_sales WHERE chat_id=? AND sale_date LIKE ?
+                 GROUP BY sale_date ORDER BY sale_date""", (chat_id, pat))
+    daily = [(r[0], r[1] or 0, r[2] or 0) for r in c.fetchall()]
+
+    # 死に筋：最新在庫あり(ending>0)だが当月未販売
+    dead = []
+    c.execute("SELECT MAX(imported_at) FROM utak_inventory WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    if row and row[0]:
+        c.execute("""SELECT category, item_name, ending, inv_value FROM utak_inventory
+                     WHERE chat_id=? AND imported_at=? AND ending > 0""", (chat_id, row[0]))
+        in_stock = {(r[0], r[1]): {'category': r[0], 'item_name': r[1],
+                                    'stock': r[2] or 0, 'inv_value': r[3] or 0} for r in c.fetchall()}
+        c.execute("SELECT DISTINCT category, item_name FROM utak_sales WHERE chat_id=? AND sale_date LIKE ?",
+                  (chat_id, pat))
+        sold = {(r[0], r[1]) for r in c.fetchall()}
+        dead = sorted((v for k, v in in_stock.items() if k not in sold),
+                      key=lambda x: x['inv_value'], reverse=True)
+
+    conn.close()
+    return {
+        'month': f"{year:04d}-{month:02d}", 'days_with_data': days_with_data,
+        'total_sales': total_sales, 'store_sales': store_sales, 'online_sales': online_sales,
+        'online_by_platform': online_by_platform, 'receipts': receipts,
+        'avg_receipts_per_day': (receipts / days_with_data) if days_with_data else 0,
+        'avg_basket': (store_sales / receipts) if receipts else 0,
+        'top_qty': top_qty, 'top_rev': top_rev, 'store_cats': store_cats,
+        'weekday': weekday, 'daily': daily, 'dead': dead[:10],
+    }
+
 def get_utak_inventory_summary(chat_id: int) -> str:
     """最新UTAKインベントリのカテゴリ別サマリーをテキストで返す。"""
     conn = get_conn()
@@ -3335,6 +3419,9 @@ def detect_intent(text: str) -> Optional[str]:
         return 'bundle_suggestions'
     if any(k in t for k in ['レシート', 'receipt', '来店数', '来店客', '客数', '客足', '来客', 'foot traffic', 'footfall']):
         return 'receipt_trend'
+    if any(k in t for k in ['月次', '月報', 'monthly', '月間レポート', '先月の売上', '今月の売上']) \
+       or re.search(r'\d{1,2}\s*月の(売上|実績|分析|レポート|データ)', t):
+        return 'monthly_report'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -3606,6 +3693,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'hourly_sales':            await cmd_hourly_sales(update, ctx)
     elif intent == 'bundle_suggestions':      await cmd_bundle_suggestions(update, ctx)
     elif intent == 'receipt_trend':           await cmd_receipt_trend(update, ctx)
+    elif intent == 'monthly_report':          await cmd_monthly_report(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
@@ -4220,6 +4308,77 @@ async def cmd_receipt_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "広告で来店が増えたかが分かります。")
     sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
+
+async def cmd_monthly_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """指定月の店全体の月次分析。「月次 2026-07」「7月の売上」等。無指定なら前月。"""
+    chat_id = update.effective_chat.id
+    text = (update.message.text or '') if update.message else ''
+    now = datetime.now(PHT)
+    m_iso = re.search(r'(20\d{2})[-/](\d{1,2})', text)
+    m_jp = re.search(r'(\d{1,2})\s*月', text)
+    if m_iso:
+        year, month = int(m_iso.group(1)), int(m_iso.group(2))
+    elif m_jp:
+        year, month = now.year, int(m_jp.group(1))
+    else:
+        prev = now.replace(day=1) - timedelta(days=1)
+        year, month = prev.year, prev.month
+    if not (1 <= month <= 12):
+        sent = await update.message.reply_text("📅 月の指定が正しくありません（例：月次 2026-07）。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+
+    d = get_monthly_report(chat_id, year, month)
+    if d.get('days_with_data', 0) == 0:
+        sent = await update.message.reply_text(f"📅 {d['month']} の売上データがありません。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+
+    def pct(x, base):
+        return (x / base * 100) if base else 0
+
+    # ── Block 1: 概要・カテゴリ・オンライン・曜日 ──
+    b1 = [f"📅 月次レポート — {d['month']}\n━━━━━━━━━━━━━━━━━━━"]
+    b1.append(f"📆 データ日数: {d['days_with_data']}日")
+    b1.append(f"💰 総売上: ₱{d['total_sales']:,.0f}")
+    b1.append(f"   🏪 店頭 ₱{d['store_sales']:,.0f} ({pct(d['store_sales'], d['total_sales']):.0f}%)"
+              f"  📱 オンライン ₱{d['online_sales']:,.0f} ({pct(d['online_sales'], d['total_sales']):.0f}%)")
+    b1.append(f"🧾 来店(レシート): {d['receipts']}件 / 平均 {d['avg_receipts_per_day']:.0f}件/日 / 客単価 ₱{d['avg_basket']:,.0f}")
+    if d['store_cats']:
+        b1.append("\n🗂 カテゴリ別売上(店頭):")
+        for cat, s, q in d['store_cats'][:12]:
+            b1.append(f"  • {cat} ₱{s:,.0f} ({pct(s, d['store_sales']):.0f}%)")
+    if d['online_by_platform']:
+        b1.append("\n📱 オンライン内訳:")
+        for plat, s in sorted(d['online_by_platform'].items(), key=lambda x: x[1], reverse=True):
+            b1.append(f"  • {plat} ₱{s:,.0f}")
+    wlabels = [(1, '月'), (2, '火'), (3, '水'), (4, '木'), (5, '金'), (6, '土'), (0, '日')]
+    b1.append("\n📈 曜日別 平均売上:")
+    b1.append("  " + " / ".join(f"{lab} ₱{d['weekday'].get(i, {}).get('avg', 0):,.0f}" for i, lab in wlabels))
+
+    # ── Block 2: 売れ筋・死に筋 ──
+    b2 = ["🏆 売れ筋TOP10（数量）"]
+    for i, (name, q, s) in enumerate(d['top_qty'], 1):
+        b2.append(f"  {i}. {name} ×{q:.0f} (₱{s:,.0f})")
+    b2.append("\n💵 売上TOP10（金額）")
+    for i, (name, s, q) in enumerate(d['top_rev'], 1):
+        b2.append(f"  {i}. {name} ₱{s:,.0f} (×{q:.0f})")
+    if d['dead']:
+        b2.append(f"\n😴 死に筋（在庫ありだが{d['month']}に未販売）")
+        for it in d['dead']:
+            b2.append(f"  • {it['item_name']} (在庫{it['stock']:.0f} / ₱{it['inv_value']:,.0f})")
+
+    # ── Block 3: 日別推移 ──
+    b3 = [f"📅 日別売上（{d['month']}）"]
+    max_s = max((s for _, s, _ in d['daily']), default=1) or 1
+    for date, s, r in d['daily']:
+        bar_len = int(s / max_s * 10) if max_s > 0 else 0
+        bar = '█' * bar_len + '░' * (10 - bar_len)
+        b3.append(f"{date[5:]} {bar} ₱{s:,.0f} ({r}件)")
+
+    for block in ("\n".join(b1), "\n".join(b2), "\n".join(b3)):
+        sent = await update.message.reply_text(block)
+        save_bot_message(chat_id, sent.message_id)
 
 # ─── UTAK auto-sync job ───────────────────────────────────
 async def utak_auto_sync(context):
