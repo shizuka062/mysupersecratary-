@@ -54,6 +54,10 @@ STORE_GROUP_IDS = [int(x.strip()) for x in _raw_ids.split(',') if x.strip()] if 
 _weekly_chat_raw = os.environ.get('WEEKLY_REPORT_CHAT_ID', '')
 WEEKLY_REPORT_CHAT_ID = int(_weekly_chat_raw.strip()) if _weekly_chat_raw.strip() else 0
 
+# 月間の仕入額（概算・固定）。みどりのマートは日本から月2回、1回₱125,000を仕入れ＝月₱250,000。
+# だいたい毎月同じなので固定値で扱う。金額が変わったらこの数値を書き換えるだけでレポートに反映される。
+MONTHLY_PURCHASE_PHP = 250000  # = ₱125,000 × 2回/月
+
 # Manager Telegram IDs for direct notifications (format: "Name:ID,Name:ID")
 _manager_ids_raw = os.environ.get('MANAGER_IDS', '')
 MANAGER_IDS: dict[str, int] = {}
@@ -3458,6 +3462,10 @@ def detect_intent(text: str) -> Optional[str]:
         return 'last_week'
     if any(k in t for k in ['今週', 'weekly', 'ウィークリー', '週次', '週レポ']):
         return 'weekly'
+    if any(k in t for k in ['経営サマリー', '3か月サマリー', '3ヶ月サマリー', '3カ月サマリー',
+                            '月別サマリー', '売上仕入在庫', '売上と仕入', '3か月まとめ', '3ヶ月まとめ',
+                            '経営まとめ', 'summary3']):
+        return 'three_month_summary'
     if any(k in t for k in ['今月', 'monthly', 'マンスリー', '月次', '月レポ', '月報', '月間レポート', '先月']) \
        or re.search(r'\d{1,2}\s*月の(売上|実績|分析|レポート|データ)', t):
         return 'monthly'
@@ -3813,6 +3821,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'bundle_suggestions':      await cmd_bundle_suggestions(update, ctx)
     elif intent == 'receipt_trend':           await cmd_receipt_trend(update, ctx)
     elif intent == 'reconcile':               await cmd_reconcile(update, ctx)
+    elif intent == 'three_month_summary':     await cmd_three_month_summary(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
@@ -4484,6 +4493,79 @@ async def cmd_reconcile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                       "自動記録のPOS(②)の方が正確な傾向。")
     b2.append("\n💡 一定倍率なら税(VAT12%)等を疑い、バラつきなら日次の付け漏れを疑います。")
     sent = await update.message.reply_text("\n".join(b2))
+    save_bot_message(chat_id, sent.message_id)
+
+def get_current_inventory_value(chat_id: int) -> dict:
+    """最新のUTAK在庫スナップショットの在庫金額合計（今の在庫総額）を返す。
+    戻り値: {'value': 合計金額, 'as_of': 取得日時, 'items': 在庫あり品目数}。データ無しなら value=None。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT MAX(imported_at) FROM utak_inventory WHERE chat_id=?', (chat_id,))
+    row = c.fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return {'value': None, 'as_of': None, 'items': 0}
+    latest = row[0]
+    c.execute('''SELECT COALESCE(SUM(inv_value), 0),
+                        SUM(CASE WHEN ending > 0 THEN 1 ELSE 0 END)
+                 FROM utak_inventory WHERE chat_id=? AND imported_at=?''', (chat_id, latest))
+    r = c.fetchone()
+    conn.close()
+    return {'value': r[0] or 0, 'as_of': latest, 'items': r[1] or 0}
+
+async def cmd_three_month_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """直近3か月の「月別売上・仕入額・（現在の）在庫金額」を1枚にまとめて出す。「経営サマリー」等。
+    ・売上＝POS明細(utak_sales)の実績（自動記録なので正確）
+    ・仕入額＝月₱250,000の固定概算（MONTHLY_PURCHASE_PHP）。今月は途中の可能性あり
+    ・在庫金額＝最新在庫スナップショットの合計（＝今の在庫総額。過去月末はさかのぼれない）"""
+    chat_id = update.effective_chat.id
+    uchat = resolve_utak_chat(chat_id)
+    now = datetime.now(PHT)
+
+    # 直近3か月（古い順）を作る
+    months = []
+    y, m = now.year, now.month
+    for _ in range(3):
+        months.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    months.reverse()
+
+    rows = []
+    for (yy, mm) in months:
+        rep = get_monthly_report(uchat, yy, mm)
+        sales = rep.get('total_sales', 0) if rep.get('days_with_data', 0) else 0
+        has_data = rep.get('days_with_data', 0) > 0
+        is_current = (yy == now.year and mm == now.month)
+        rows.append({'ym': f"{yy:04d}-{mm:02d}", 'sales': sales, 'has_data': has_data,
+                     'purchase': MONTHLY_PURCHASE_PHP, 'current': is_current})
+
+    inv = get_current_inventory_value(uchat)
+
+    lines = ["📊 経営サマリー（直近3か月）\n━━━━━━━━━━━━━━━━━━━"]
+    lines.append("月       売上        仕入額      差引(売上−仕入)")
+    for r in rows:
+        diff = r['sales'] - r['purchase']
+        sales_str = f"₱{r['sales']:>9,.0f}" if r['has_data'] else "  データなし"
+        mark = " ←今月途中" if r['current'] else ""
+        lines.append(f"{r['ym']}  {sales_str}  ₱{r['purchase']:>8,.0f}  ₱{diff:>+10,.0f}{mark}")
+
+    lines.append("")
+    if inv['value'] is not None:
+        as_of = (inv['as_of'] or '')[:10]
+        lines.append(f"💰 現在の在庫金額（今の総額）: ₱{inv['value']:,.0f}")
+        lines.append(f"   （{as_of}時点の在庫 / 在庫あり {inv['items']}品目）")
+    else:
+        lines.append("💰 現在の在庫金額: 在庫データがまだありません")
+
+    lines.append("")
+    lines.append("※売上＝レジ(POS)の実績で正確な数字です。")
+    lines.append(f"※仕入額＝月2回×₱125,000＝₱{MONTHLY_PURCHASE_PHP:,.0f}の固定概算。金額が変わったら教えてください。")
+    lines.append("※「差引」は売上−仕入の単純な引き算で、正確な利益ではありません（在庫や原価は含みません）。")
+    lines.append("※在庫金額は『今の総額』です。過去の月末時点にはさかのぼれません。")
+
+    sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
 
 # ─── UTAK auto-sync job ───────────────────────────────────
