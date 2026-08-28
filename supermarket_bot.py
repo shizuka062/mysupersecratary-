@@ -93,6 +93,11 @@ BRAVE_SEARCH_API_KEY = os.environ.get('BRAVE_SEARCH_API_KEY', '')
 UTAK_EMAIL    = os.environ.get('UTAK_EMAIL', '')
 UTAK_PASSWORD = os.environ.get('UTAK_PASSWORD', '')
 
+# GrabMerchant credentials for the monthly Insights download.
+# Grabは商品別実績を90日しか保持しないため、取り逃すと復元できない。
+GRAB_EMAIL    = os.environ.get('GRAB_EMAIL', '')
+GRAB_PASSWORD = os.environ.get('GRAB_PASSWORD', '')
+
 # DB directory auto-create
 pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
@@ -3788,6 +3793,8 @@ def detect_intent(text: str) -> Optional[str]:
     if any(k in t for k in ['utak在庫', 'utak stock', '在庫サマリー', 'pos在庫']):
         return 'utak_stock'
     # Grab系は「売れ筋」より前に判定する（'売れ筋'の部分一致に飲まれるため）
+    if any(k in t for k in ['grab同期', 'grab取得', 'grabダウンロード', 'grab sync']):
+        return 'grab_sync'
     if any(k in t for k in ['統合売れ筋', '統合ランキング', '店頭+grab', '店頭＋grab', '合算売れ筋']):
         return 'combined_bestsellers'
     if any(k in t for k in ['grab売れ筋', 'grab商品', 'grabの売れ筋', 'ネット売れ筋', 'grab item']):
@@ -4079,6 +4086,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'grab_items':              await cmd_grab_items(update, ctx)
     elif intent == 'grab_shortage':           await cmd_grab_shortage(update, ctx)
     elif intent == 'combined_bestsellers':    await cmd_combined_bestsellers(update, ctx)
+    elif intent == 'grab_sync':               await cmd_grab_sync(update, ctx)
     elif intent == 'hourly_sales':            await cmd_hourly_sales(update, ctx)
     elif intent == 'bundle_suggestions':      await cmd_bundle_suggestions(update, ctx)
     elif intent == 'receipt_trend':           await cmd_receipt_trend(update, ctx)
@@ -5126,6 +5134,237 @@ async def utak_auto_sync(context):
         except Exception:
             pass
 
+async def _grab_download_csvs(log: list) -> dict:
+    """GrabMerchant Insights から商品別実績CSVをダウンロードする。
+    戻り値: {'menu': path or None, 'under': path or None, 'shot': path or None}
+
+    Grabの管理画面はSPAでクラス名が変わりやすいため、CSSではなく
+    表示テキストでたどる。どこで失敗してもスクリーンショットを残し、
+    Telegramに送って原因を目で確認できるようにする。"""
+    from playwright.async_api import async_playwright
+    out = {'menu': None, 'under': None, 'shot': None}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(accept_downloads=True,
+                                        viewport={'width': 1600, 'height': 1000})
+        page = await ctx.new_page()
+
+        async def shot(tag):
+            try:
+                out['shot'] = f'/tmp/grab_{tag}.png'
+                await page.screenshot(path=out['shot'], full_page=False)
+            except Exception:
+                out['shot'] = None
+
+        async def close_popups():
+            """バナーやフィードバック依頼の×を閉じる。クリックを邪魔するため。"""
+            for sel in ('button[aria-label="close"]', 'button[aria-label="Close"]',
+                        '[class*="close"]', 'button:has-text("×")'):
+                try:
+                    for i in range(4):
+                        b = page.locator(sel).nth(i)
+                        if await b.count() > 0 and await b.is_visible():
+                            await b.click(timeout=1500)
+                            await asyncio.sleep(0.5)
+                except Exception:
+                    continue
+
+        try:
+            log.append('ログイン画面を開く')
+            await page.goto('https://merchant.grab.com/', timeout=60000)
+            await asyncio.sleep(4)
+            # メール/パスワード欄はプレースホルダの表記ゆれがあるため type で拾う
+            await page.fill('input[type="email"], input[name="email"], input[type="text"]',
+                            GRAB_EMAIL, timeout=20000)
+            await page.fill('input[type="password"]', GRAB_PASSWORD, timeout=20000)
+            for sel in ('button[type="submit"]', 'button:has-text("Log in")',
+                        'button:has-text("Login")', 'button:has-text("Sign in")'):
+                try:
+                    b = page.locator(sel).first
+                    if await b.count() > 0 and await b.is_visible():
+                        await b.click(timeout=5000)
+                        break
+                except Exception:
+                    continue
+            await asyncio.sleep(12)
+            if 'login' in page.url.lower() or 'signin' in page.url.lower():
+                await shot('login_failed')
+                raise RuntimeError(f'ログインできませんでした（URL={page.url}）。'
+                                   'ワンタイムコードを求められている可能性があります。')
+            log.append(f'ログイン成功（{page.url}）')
+
+            log.append('Insights → Menu / Catalogue を開く')
+            for url in ('https://merchant.grab.com/insights?tab=menu',
+                        'https://merchant.grab.com/insights'):
+                await page.goto(url, timeout=60000)
+                await asyncio.sleep(6)
+                await close_popups()
+                tab = page.locator('text=/Menu\\s*\\/\\s*Catalogue/i').first
+                if await tab.count() > 0:
+                    try:
+                        await tab.click(timeout=8000)
+                        await asyncio.sleep(6)
+                    except Exception:
+                        pass
+                    break
+            await close_popups()
+
+            # 期間をできるだけ長く（Grabは最大90日）
+            log.append('期間を最大（90日）に設定')
+            try:
+                picker = page.locator('div,button').filter(
+                    has_text=re.compile(r'\d{1,2}\s+\w{3}\s*-\s*\d{1,2}\s+\w{3}')).first
+                if await picker.count() > 0:
+                    await picker.click(timeout=8000)
+                    await asyncio.sleep(2)
+                    for label in ('Last 90 days', 'Past 90 days', '90 days', 'Last 3 months'):
+                        opt = page.locator(f'text="{label}"').first
+                        if await opt.count() > 0 and await opt.is_visible():
+                            await opt.click(timeout=5000)
+                            log.append(f'期間: {label}')
+                            await asyncio.sleep(6)
+                            break
+                    else:
+                        log.append('⚠️ 90日のプリセットが見つからず既定の期間で続行')
+                        await page.keyboard.press('Escape')
+            except Exception as e:
+                log.append(f'⚠️ 期間設定をスキップ: {e}')
+            await close_popups()
+
+            async def click_download(tag):
+                """Item performance セクションの Download を押してCSVを保存。"""
+                async with page.expect_download(timeout=60000) as dl:
+                    btn = page.locator('text=/^\\s*Download\\s*$/').first
+                    await btn.click(timeout=15000)
+                    await asyncio.sleep(2)
+                    # 形式選択が出る場合は CSV → Excel の順で選ぶ
+                    for label in ('CSV', 'Excel', '.csv', '.xlsx'):
+                        opt = page.locator(f'text="{label}"').first
+                        try:
+                            if await opt.count() > 0 and await opt.is_visible():
+                                await opt.click(timeout=4000)
+                                break
+                        except Exception:
+                            continue
+                d = await dl.value
+                path = f'/tmp/grab_{tag}{os.path.splitext(d.suggested_filename)[1] or ".csv"}'
+                await d.save_as(path)
+                return path
+
+            log.append('Top-selling items をダウンロード')
+            try:
+                top = page.locator('text=/Top-selling items/i').first
+                if await top.count() > 0:
+                    await top.click(timeout=8000)
+                    await asyncio.sleep(3)
+            except Exception:
+                pass
+            out['menu'] = await click_download('menu')
+            log.append(f'✅ 商品別: {os.path.basename(out["menu"])}')
+
+            log.append('Understocked items をダウンロード')
+            try:
+                us = page.locator('text=/Understocked items/i').first
+                if await us.count() > 0:
+                    await us.click(timeout=8000)
+                    await asyncio.sleep(5)
+                    out['under'] = await click_download('under')
+                    log.append(f'✅ 欠品: {os.path.basename(out["under"])}')
+                else:
+                    log.append('⚠️ Understocked items のタブが見つかりませんでした')
+            except Exception as e:
+                log.append(f'⚠️ 欠品の取得に失敗: {e}')
+
+            if not out['shot']:
+                await shot('ok')
+        except Exception:
+            if not out['shot']:
+                await shot('error')
+            raise
+        finally:
+            await browser.close()
+    return out
+
+def _read_csv_rows(path: str) -> list:
+    """CSV/Excelのどちらでも読めるようにする。Excelはopenpyxlがある場合のみ。"""
+    if path.lower().endswith(('.xlsx', '.xls')):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb.active
+            it = ws.iter_rows(values_only=True)
+            header = [str(h or '') for h in next(it)]
+            return [dict(zip(header, [('' if v is None else v) for v in row])) for row in it]
+        except ImportError:
+            raise RuntimeError('Excel形式で落ちてきましたが openpyxl が入っていません。'
+                               'CSVを選ぶか requirements に openpyxl を追加してください。')
+    with open(path, 'r', encoding='utf-8-sig') as f:
+        return list(csv.DictReader(f))
+
+async def grab_auto_sync(context, notify_chat: int = 0):
+    """GrabMerchantから商品別実績を自動取得してDBに取り込む。
+    Grabは90日しか遡れないため月1回で十分。失敗時はスクショを送る。"""
+    chat_id = notify_chat or OWNER_CHAT_ID or REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
+    if not GRAB_EMAIL or not GRAB_PASSWORD:
+        if notify_chat:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=('Grabの認証情報が未設定です。\n'
+                      'Railway の Variables に GRAB_EMAIL と GRAB_PASSWORD を追加してください。'))
+        else:
+            logger.info('Grab credentials not set — auto-sync skipped')
+        return
+    log = []
+    try:
+        files = await _grab_download_csvs(log)
+        msgs = []
+        if files.get('menu'):
+            n = import_grab_menu_sales_csv(chat_id, _read_csv_rows(files['menu']))
+            best = get_grab_bestsellers(chat_id, limit=5)
+            msgs.append(f'🚗 商品別: {n}行取り込み（{best["from"]}〜{best["to"]} / '
+                        f'{best["n_items"]}商品 / ₱{best["total"]:,.0f}）')
+            for i, r in enumerate(best['rows'], 1):
+                msgs.append(f'   {i}. {r["item"]}: {r["qty"]:.0f}点 / ₱{r["amt"]:,.0f}')
+        if files.get('under'):
+            n = import_grab_understocked_csv(chat_id, _read_csv_rows(files['under']))
+            sh = get_grab_understocked_top(chat_id, limit=3)
+            msgs.append(f'\n⚠️ 欠品: {n}行取り込み（売り逃し合計 ₱{sh["total"]:,.0f}）')
+            for i, r in enumerate(sh['rows'], 1):
+                msgs.append(f'   {i}. {r["item"]}: 欠品{r["short"]:.0f}点 / ₱{r["lost"]:,.0f}')
+        now = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
+        head = f'🔄 Grab Auto-Sync 完了（{now}）\n'
+        if not msgs:
+            head = f'⚠️ Grab Auto-Sync: ファイルを取得できませんでした（{now}）\n'
+            msgs = ['— 手順ログ —'] + [f'  {l}' for l in log]
+        await context.bot.send_message(chat_id=chat_id, text=head + '\n'.join(msgs))
+        if not files.get('menu') and files.get('shot'):
+            with open(files['shot'], 'rb') as f:
+                await context.bot.send_photo(chat_id=chat_id, photo=f,
+                                             caption='失敗時の画面（原因確認用）')
+    except Exception as e:
+        logger.error(f'Grab auto-sync failed: {e}')
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=('❌ Grab自動同期エラー\n'
+                      f'{e}\n\n— どこまで進んだか —\n' + '\n'.join(f'  {l}' for l in log) +
+                      '\n\n手動でDLしてこのチャットに送れば取り込めます。'))
+        except Exception:
+            pass
+
+async def grab_auto_sync_job(context):
+    """毎月1日に自動取得を実行（日次で起動し、1日だけ動く）。"""
+    if datetime.now(PHT).day != 1:
+        return
+    await grab_auto_sync(context)
+
+async def cmd_grab_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """手動でGrab自動同期を試す（初回テスト用）。"""
+    chat_id = update.effective_chat.id
+    sent = await update.message.reply_text('🔄 Grabから取得してみます。1〜2分かかります…')
+    save_bot_message(chat_id, sent.message_id)
+    await grab_auto_sync(ctx, notify_chat=chat_id)
+
 async def grab_download_reminder_job(context):
     """毎月1日に、Grabの商品別データを落として送るようリマインドする。
     GrabMerchantのデータは90日で消えるため、取り逃すと復元できない。"""
@@ -5324,6 +5563,16 @@ def main():
             name='grab_download_reminder',
         )
         logger.info("Grab download reminder scheduled: 1st of month 09:00 PHT")
+        # Grab自動取得: 毎月1日 09:30 PHT（認証情報がある場合のみ）
+        if GRAB_EMAIL and GRAB_PASSWORD:
+            app.job_queue.run_daily(
+                grab_auto_sync_job,
+                time=dtime(9, 30, tzinfo=PHT),
+                name='grab_auto_sync',
+            )
+            logger.info("Grab auto-sync scheduled: 1st of month 09:30 PHT")
+        else:
+            logger.info("Grab credentials not set — auto-sync disabled (reminder only)")
     elif not WEEKLY_REPORT_CHAT_ID:
         logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
