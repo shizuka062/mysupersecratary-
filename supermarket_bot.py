@@ -13,6 +13,7 @@ import asyncio
 import logging
 import pathlib
 import calendar
+import math
 from datetime import datetime, timedelta, time as dtime, timezone
 from typing import Optional
 
@@ -1456,30 +1457,62 @@ def get_utak_reorder_list(chat_id: int) -> list[dict]:
         conn.close()
         return []
     latest = row[0]
+    # ダミー商品（GRABMART等）は棚の商品ではないのでリストから除く
     c.execute('''SELECT category, item_name, option, ending, inv_value
-                 FROM utak_inventory WHERE chat_id=? AND imported_at=?''',
+                 FROM utak_inventory WHERE chat_id=? AND imported_at=?
+                   AND category NOT IN ('GRABMART','GRABFOOD','FOOD PANDA')''',
               (chat_id, latest))
     inv_map = {}
     for r in c.fetchall():
         key = (r[0], r[1])
         inv_map[key] = {'category': r[0], 'item_name': r[1], 'option': r[2],
                         'stock': r[3], 'inv_value': r[4]}
-    # 過去14日の売上速度（1日あたり）
-    since = (datetime.now(PHT) - timedelta(days=14)).strftime('%Y-%m-%d')
-    c.execute('''SELECT category, item_name, SUM(qty) as total_qty, COUNT(DISTINCT sale_date) as days_sold
-                 FROM utak_sales WHERE chat_id=? AND sale_date>=?
-                 GROUP BY category, item_name''', (chat_id, since))
-    sales_map = {}
-    for r in c.fetchall():
-        key = (r[0], r[1])
-        total_qty = r[2]
-        daily_rate = total_qty / 14.0
-        sales_map[key] = {'total_qty': total_qty, 'daily_rate': daily_rate, 'days_sold': r[3]}
+    # 売上速度。判定ルールどおり max(30日/30, 60日/60) を採用し、
+    # **Grab販売分を必ず含める**（Grabは item_name がカテゴリー名で、実商品名は option 列にある。
+    # item_name だけで集計すると販売点数の約18%が抜け落ちる）。
+    d14 = (datetime.now(PHT) - timedelta(days=14)).strftime('%Y-%m-%d')
+    d30 = (datetime.now(PHT) - timedelta(days=30)).strftime('%Y-%m-%d')
+    d60 = (datetime.now(PHT) - timedelta(days=60)).strftime('%Y-%m-%d')
+    store, grab = {}, {}
+    c.execute('''SELECT item_name,
+                        SUM(CASE WHEN sale_date>=? THEN qty ELSE 0 END),
+                        SUM(CASE WHEN sale_date>=? THEN qty ELSE 0 END),
+                        SUM(CASE WHEN sale_date>=? THEN qty ELSE 0 END)
+                 FROM utak_sales
+                 WHERE chat_id=? AND sale_date>=?
+                   AND category NOT IN ('GRABMART','GRABFOOD','FOOD PANDA')
+                 GROUP BY item_name''', (d14, d30, d60, chat_id, d60))
+    for n, q14, q30, q60 in c.fetchall():
+        store[n] = (q14 or 0, q30 or 0, q60 or 0)
+    c.execute('''SELECT TRIM(option),
+                        SUM(CASE WHEN sale_date>=? THEN qty ELSE 0 END),
+                        SUM(CASE WHEN sale_date>=? THEN qty ELSE 0 END),
+                        SUM(CASE WHEN sale_date>=? THEN qty ELSE 0 END)
+                 FROM utak_sales
+                 WHERE chat_id=? AND sale_date>=?
+                   AND category IN ('GRABMART','GRABFOOD','FOOD PANDA')
+                   AND TRIM(COALESCE(option,''))<>''
+                 GROUP BY TRIM(option)''', (d14, d30, d60, chat_id, d60))
+    for n, q14, q30, q60 in c.fetchall():
+        grab[n] = (q14 or 0, q30 or 0, q60 or 0)
     conn.close()
+
+    sales_map = {}
+    for key, inv in inv_map.items():
+        n = inv['item_name']
+        s = store.get(n, (0, 0, 0))
+        g = grab.get(n, (0, 0, 0))
+        q14, q30, q60 = s[0] + g[0], s[1] + g[1], s[2] + g[2]
+        sales_map[key] = {
+            'total_qty': q14,
+            'daily_rate': max(q30 / 30.0, q60 / 60.0),
+            'days_sold': 0,
+            'grab_qty_60': g[2],
+        }
     # Merge and calculate
     results = []
     for key, inv in inv_map.items():
-        sale = sales_map.get(key, {'total_qty': 0, 'daily_rate': 0, 'days_sold': 0})
+        sale = sales_map.get(key, {'total_qty': 0, 'daily_rate': 0, 'days_sold': 0, 'grab_qty_60': 0})
         stock = inv['stock']
         daily_rate = sale['daily_rate']
         if daily_rate > 0 and stock > 0:
@@ -1506,6 +1539,7 @@ def get_utak_reorder_list(chat_id: int) -> list[dict]:
             results.append({
                 **inv,
                 'total_sold_14d': sale['total_qty'],
+                'grab_qty_60': sale.get('grab_qty_60', 0),
                 'daily_rate': daily_rate,
                 'days_left': days_left,
                 'priority': priority,
@@ -5467,17 +5501,34 @@ async def auto_reorder_job(context):
         if len(normal) > 15:
             lines.append(f"  ...and {len(normal)-15} more (see CSV)")
     lines.append(f"\nTotal: 🔴{len(urgent)} + 🟡{len(warning)} + 🟢{len(normal)} = {len(reorder)} items")
+    grab_heavy = [r for r in reorder if r.get('grab_qty_60', 0) > 0]
+    lines.append(f"\n📌 Daily sales now INCLUDE Grab orders ({len(grab_heavy)} items have Grab demand).")
+    lines.append("   Suggested order quantity is in the CSV (22-day target; 16 days for CHILLED).")
+    chilled = [r for r in reorder if r['category'] == 'CHILLED ITEM']
+    if chilled:
+        lines.append(f"   ⚠️ {len(chilled)} chilled items - check expiry dates before increasing quantity.")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
     # CSV (English headers)
     csv_buf = io.StringIO()
     csv_buf.write('\ufeff')
     writer = csv.writer(csv_buf)
-    writer.writerow(['Priority', 'Category', 'Item', 'Current Stock', 'Daily Sales', 'Days Left', '14-Day Total Sales'])
+    writer.writerow(['Priority', 'Category', 'Item', 'Current Stock',
+                     'Daily Sales (store+Grab)', 'Days Left', '14-Day Total Sales',
+                     'Grab Qty (60d)', 'Suggested Order', 'Target Days', 'Note'])
     for it in reorder:
+        # 賞味期限の短い冷蔵品は22日分だと期限内に売り切れないため16日分に抑える
+        target_days = 16 if it['category'] == 'CHILLED ITEM' else 22
+        # 在庫マイナスをそのまま引くと過剰発注になる（バラ売り・店内製造品は構造的にマイナス）。
+        # 判定ルール第5条に合わせ、マイナス在庫は0として扱い、現物確認のフラグを立てる。
+        need = max(0, math.ceil(it['daily_rate'] * target_days) - max(it['stock'], 0))
+        note = 'CHECK ACTUAL STOCK (negative)' if it['stock'] < 0 else ''
+        if it['category'] == 'CHILLED ITEM':
+            note = (note + ' / ' if note else '') + 'CHECK EXPIRY'
         writer.writerow([it['priority'], it['category'], it['item_name'],
                          f"{it['stock']:.0f}", f"{it['daily_rate']:.1f}",
                          f"{it['days_left']:.0f}" if it['days_left'] < 999 else '-',
-                         f"{it['total_sold_14d']:.0f}"])
+                         f"{it['total_sold_14d']:.0f}", f"{it.get('grab_qty_60', 0):.0f}",
+                         f"{need:.0f}", target_days, note])
     csv_bytes = csv_buf.getvalue().encode('utf-8-sig')
     date_str = tomorrow.strftime('%Y%m%d')
     await context.bot.send_document(
