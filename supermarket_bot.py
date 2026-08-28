@@ -285,6 +285,39 @@ def init_db():
             cashier       TEXT DEFAULT ''
         )
     ''')
+    # GrabMerchant Insights > Menu/Catalogue > Item performance の商品別実績。
+    # UTAKのレジはGrab注文をカテゴリー名のダミー商品で記録するため商品名が残らない。
+    # Grab側の明細を別テーブルで持ち、商品名で店頭実績と突き合わせる。
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS grab_sales (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id       INTEGER NOT NULL,
+            sale_date     TEXT NOT NULL,
+            grab_service  TEXT DEFAULT '',
+            merchant      TEXT DEFAULT '',
+            item_name     TEXT NOT NULL,
+            units_sold    REAL DEFAULT 0,
+            gross_sales   REAL DEFAULT 0,
+            imported_at   TEXT NOT NULL,
+            UNIQUE(chat_id, sale_date, grab_service, item_name)
+        )
+    ''')
+    # 同 > Understocked items。在庫切れで応えられなかった注文＝売り逃し。
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS grab_understocked (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id       INTEGER NOT NULL,
+            short_date    TEXT NOT NULL,
+            item_name     TEXT NOT NULL,
+            sku           TEXT DEFAULT '',
+            barcode       TEXT DEFAULT '',
+            units_ordered REAL DEFAULT 0,
+            shortage      REAL DEFAULT 0,
+            lost_sales    REAL DEFAULT 0,
+            imported_at   TEXT NOT NULL,
+            UNIQUE(chat_id, short_date, item_name)
+        )
+    ''')
     conn.commit()
     conn.close()
     logger.info("Database initialized.")
@@ -696,6 +729,225 @@ def import_utak_sales_csv(chat_id: int, rows: list[dict]) -> int:
     conn.commit()
     conn.close()
     return count
+
+# ─── Grab (GrabMerchant Insights) ──────────────────────────
+def detect_grab_csv_type(header: list[str]) -> str:
+    """GrabMerchantからDLしたCSVの種類を判定。
+    Menu Sales      : Date, Country, City, Merchant, Grab Service, Item, Units Sold, Item Gross Sales (P)
+    Understocked    : Date, Item, SKU Number, Barcode number, Units Ordered, Shortage, Lost Sales (P)
+    Transactions    : Merchant Name, Merchant ID, Store Name, ... （注文単位・商品名なし）
+    ヘッダーに通貨記号が入るので部分一致で見る。"""
+    h = [c.lower().strip() for c in header]
+    joined = ' | '.join(h)
+    if 'units sold' in joined and 'item' in h:
+        return 'grab_menu_sales'
+    if 'shortage' in joined and 'lost sales' in joined:
+        return 'grab_understocked'
+    if 'merchant id' in h and 'long order id' in h:
+        return 'grab_transactions'
+    return 'unknown'
+
+def _parse_grab_date(raw: str) -> str:
+    """GrabのCSVは種類によって日付書式が違う（dd/mm/yyyy と yyyy/mm/dd）。YYYY-MM-DDに揃える。"""
+    s = (raw or '').strip()
+    for fmt in ('%d/%m/%Y', '%Y/%m/%d', '%Y-%m-%d', '%d-%m-%Y', '%d %b %Y'):
+        try:
+            return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+        except Exception:
+            continue
+    return s
+
+def _grab_col(row: dict, *needles: str) -> str:
+    """ヘッダーに通貨記号や表記ゆれがあるため、部分一致で列を引く。"""
+    for k in row.keys():
+        kl = (k or '').lower()
+        if all(n in kl for n in needles):
+            return row.get(k) or ''
+    return ''
+
+def import_grab_menu_sales_csv(chat_id: int, rows: list[dict]) -> int:
+    """Grab商品別売上CSVを取り込む。同じ日・同じ商品は上書き（90日窓が毎月重なるため）。"""
+    now = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
+    target = resolve_utak_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    count = 0
+    for r in rows:
+        item = (_grab_col(r, 'item') or '').strip()
+        if not item or 'gross' in item.lower():
+            continue
+        date = _parse_grab_date(_grab_col(r, 'date'))
+        units = _parse_float(_grab_col(r, 'units', 'sold'))
+        gross = _parse_float(_grab_col(r, 'gross', 'sales'))
+        if not date or units == 0:
+            continue
+        c.execute('''INSERT OR REPLACE INTO grab_sales
+                     (chat_id, sale_date, grab_service, merchant, item_name,
+                      units_sold, gross_sales, imported_at)
+                     VALUES (?,?,?,?,?,?,?,?)''',
+                  (target, date, (_grab_col(r, 'grab', 'service') or '').strip(),
+                   (_grab_col(r, 'merchant') or '').strip(), item, units, gross, now))
+        count += 1
+    conn.commit()
+    conn.close()
+    return count
+
+def import_grab_understocked_csv(chat_id: int, rows: list[dict]) -> int:
+    """Grab欠品（売り逃し）CSVを取り込む。"""
+    now = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
+    target = resolve_utak_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    count = 0
+    for r in rows:
+        item = (_grab_col(r, 'item') or '').strip()
+        date = _parse_grab_date(_grab_col(r, 'date'))
+        if not item or not date:
+            continue
+        c.execute('''INSERT OR REPLACE INTO grab_understocked
+                     (chat_id, short_date, item_name, sku, barcode,
+                      units_ordered, shortage, lost_sales, imported_at)
+                     VALUES (?,?,?,?,?,?,?,?,?)''',
+                  (target, date, item,
+                   (_grab_col(r, 'sku') or '').strip(),
+                   (_grab_col(r, 'barcode') or '').strip(),
+                   _parse_float(_grab_col(r, 'units', 'ordered')),
+                   _parse_float(_grab_col(r, 'shortage')),
+                   _parse_float(_grab_col(r, 'lost', 'sales')), now))
+        count += 1
+    conn.commit()
+    conn.close()
+    return count
+
+def _sqkey(s: str) -> str:
+    """商品名の照合キー。空白・記号・大小文字を無視する。"""
+    return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
+
+def _utak_name_index(chat_id: int) -> dict:
+    """UTAKの商品名 -> (カテゴリー, 表示名) の辞書。Grabの商品名を紐づけるのに使う。
+    売上実績を先に入れ、在庫マスターで補う（店頭で売れていない商品もGrabでは売れるため）。"""
+    conn = get_conn()
+    c = conn.cursor()
+    idx = {}
+    try:
+        c.execute('''SELECT item_name, category FROM utak_sales
+                     WHERE chat_id=? AND category NOT IN ('GRABMART','GRABFOOD','FOOD PANDA')
+                     GROUP BY item_name, category''', (chat_id,))
+        for name, cat in c.fetchall():
+            idx.setdefault(_sqkey(name), (cat, name))
+        c.execute('''SELECT item_name, category FROM utak_inventory
+                     WHERE chat_id=?
+                       AND imported_at=(SELECT MAX(imported_at) FROM utak_inventory WHERE chat_id=?)
+                       AND category NOT IN ('GRABMART','GRABFOOD','FOOD PANDA')
+                     GROUP BY item_name, category''', (chat_id, chat_id))
+        for name, cat in c.fetchall():
+            idx.setdefault(_sqkey(name), (cat, name))
+    except Exception as e:
+        logger.warning(f"_utak_name_index failed: {e}")
+    conn.close()
+    return idx
+
+def _match_grab_item(key: str, idx: dict) -> tuple:
+    """Grab商品名をUTAK商品に紐づける。完全一致 → 包含関係の順。"""
+    if key in idx:
+        return idx[key]
+    for k, v in idx.items():
+        if len(k) > 12 and (k in key or key in k):
+            return v
+    return (None, None)
+
+def get_grab_bestsellers(chat_id: int, limit: int = 20, days: int = 0) -> dict:
+    """Grabの商品別売れ筋。days>0なら直近N日に絞る。"""
+    target = resolve_utak_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    where, params = 'chat_id=?', [target]
+    if days > 0:
+        since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
+        where += ' AND sale_date>=?'
+        params.append(since)
+    c.execute(f'''SELECT item_name, SUM(units_sold), SUM(gross_sales), COUNT(DISTINCT sale_date)
+                  FROM grab_sales WHERE {where}
+                  GROUP BY item_name ORDER BY SUM(gross_sales) DESC''', params)
+    rows = [{'item': r[0], 'qty': r[1], 'amt': r[2], 'days': r[3]} for r in c.fetchall()]
+    c.execute(f'SELECT MIN(sale_date), MAX(sale_date), SUM(gross_sales) FROM grab_sales WHERE {where}', params)
+    mn, mx, total = c.fetchone()
+    conn.close()
+    return {'rows': rows[:limit], 'n_items': len(rows), 'from': mn, 'to': mx, 'total': total or 0}
+
+def get_grab_understocked_top(chat_id: int, limit: int = 20) -> dict:
+    """Grabの欠品による売り逃し。"""
+    target = resolve_utak_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT item_name, SUM(units_ordered), SUM(shortage), SUM(lost_sales),
+                        COUNT(DISTINCT short_date), MAX(sku)
+                 FROM grab_understocked WHERE chat_id=?
+                 GROUP BY item_name ORDER BY SUM(lost_sales) DESC''', (target,))
+    rows = [{'item': r[0], 'ordered': r[1], 'short': r[2], 'lost': r[3], 'days': r[4], 'sku': r[5]}
+            for r in c.fetchall()]
+    c.execute('SELECT MIN(short_date), MAX(short_date), SUM(lost_sales) FROM grab_understocked WHERE chat_id=?',
+              (target,))
+    mn, mx, total = c.fetchone()
+    conn.close()
+    return {'rows': rows[:limit], 'n_items': len(rows), 'from': mn, 'to': mx, 'total': total or 0}
+
+def get_combined_bestsellers(chat_id: int, category: str = '', limit: int = 10) -> dict:
+    """店頭(UTAK) + Grab を商品名で統合した売れ筋。
+    期間はGrabデータのある範囲に合わせる（Grabは90日しか遡れないため）。"""
+    target = resolve_utak_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT MIN(sale_date), MAX(sale_date) FROM grab_sales WHERE chat_id=?', (target,))
+    d0, d1 = c.fetchone()
+    if not d0:
+        conn.close()
+        return {'cats': {}, 'from': None, 'to': None}
+    # 店頭
+    c.execute('''SELECT item_name, category, SUM(qty), SUM(gross_price)
+                 FROM utak_sales
+                 WHERE chat_id=? AND sale_date BETWEEN ? AND ?
+                   AND category NOT IN ('GRABMART','GRABFOOD','FOOD PANDA')
+                 GROUP BY item_name, category''', (target, d0, d1))
+    store = c.fetchall()
+    # Grab
+    c.execute('''SELECT item_name, SUM(units_sold), SUM(gross_sales)
+                 FROM grab_sales WHERE chat_id=? GROUP BY item_name''', (target,))
+    grab = c.fetchall()
+    conn.close()
+
+    idx, agg = {}, {}
+    for name, cat, qty, amt in store:
+        idx.setdefault(_sqkey(name), (cat, name))
+        a = agg.setdefault(name, {'cat': cat, 's_qty': 0.0, 's_amt': 0.0, 'g_qty': 0.0, 'g_amt': 0.0})
+        a['s_qty'] += qty or 0
+        a['s_amt'] += amt or 0
+    unmatched = []
+    for name, qty, amt in grab:
+        cat, disp = _match_grab_item(_sqkey(name), idx)
+        if not cat:
+            unmatched.append({'item': name, 'qty': qty, 'amt': amt})
+            continue
+        a = agg.setdefault(disp, {'cat': cat, 's_qty': 0.0, 's_amt': 0.0, 'g_qty': 0.0, 'g_amt': 0.0})
+        a['g_qty'] += qty or 0
+        a['g_amt'] += amt or 0
+    out = {}
+    for name, a in agg.items():
+        if category and a['cat'] != category:
+            continue
+        amt = a['s_amt'] + a['g_amt']
+        if amt <= 0:
+            continue
+        out.setdefault(a['cat'], []).append({
+            'item': name, 'qty': a['s_qty'] + a['g_qty'], 'amt': amt,
+            's_amt': a['s_amt'], 'g_amt': a['g_amt'],
+            'g_pct': round(a['g_amt'] / amt * 100, 1),
+        })
+    for cat in out:
+        out[cat].sort(key=lambda r: -r['amt'])
+        out[cat] = out[cat][:limit]
+    return {'cats': out, 'from': d0, 'to': d1,
+            'unmatched': sorted(unmatched, key=lambda r: -r['amt'])[:10]}
 
 def get_utak_low_stock(chat_id: int, threshold: int = 3) -> list[dict]:
     """在庫が少ない（ending <= threshold）かつ売れている商品を取得。"""
@@ -3535,6 +3787,13 @@ def detect_intent(text: str) -> Optional[str]:
         return 'utak_analysis'
     if any(k in t for k in ['utak在庫', 'utak stock', '在庫サマリー', 'pos在庫']):
         return 'utak_stock'
+    # Grab系は「売れ筋」より前に判定する（'売れ筋'の部分一致に飲まれるため）
+    if any(k in t for k in ['統合売れ筋', '統合ランキング', '店頭+grab', '店頭＋grab', '合算売れ筋']):
+        return 'combined_bestsellers'
+    if any(k in t for k in ['grab売れ筋', 'grab商品', 'grabの売れ筋', 'ネット売れ筋', 'grab item']):
+        return 'grab_items'
+    if any(k in t for k in ['欠品', '売り逃し', 'understock', 'lost sales', '在庫切れ注文']):
+        return 'grab_shortage'
     if any(k in t for k in ['売れ筋', 'bestseller', 'ベストセラー', '売上ランキング', '人気商品']):
         return 'utak_bestsellers'
     if any(k in t for k in ['死に筋', 'dead stock', 'デッドストック', '売れ残り', '不良在庫']):
@@ -3817,6 +4076,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'utak_bestsellers':        await cmd_utak_bestsellers(update, ctx)
     elif intent == 'dead_stock':              await cmd_dead_stock(update, ctx)
     elif intent == 'online_sales':            await cmd_online_sales(update, ctx)
+    elif intent == 'grab_items':              await cmd_grab_items(update, ctx)
+    elif intent == 'grab_shortage':           await cmd_grab_shortage(update, ctx)
+    elif intent == 'combined_bestsellers':    await cmd_combined_bestsellers(update, ctx)
     elif intent == 'hourly_sales':            await cmd_hourly_sales(update, ctx)
     elif intent == 'bundle_suggestions':      await cmd_bundle_suggestions(update, ctx)
     elif intent == 'receipt_trend':           await cmd_receipt_trend(update, ctx)
@@ -4238,6 +4500,43 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sent = await update.message.reply_text("⚠️ CSVファイルにデータがありません。")
         save_bot_message(chat_id, sent.message_id)
         return
+    # GrabMerchantのCSVを先に判定（UTAKと列名が重ならないため誤判定しない）
+    grab_type = detect_grab_csv_type(list(rows[0].keys()))
+    if grab_type == 'grab_menu_sales':
+        count = import_grab_menu_sales_csv(chat_id, rows)
+        best = get_grab_bestsellers(chat_id, limit=10)
+        lines = [f"✅ Grab商品別売上を取り込みました（{count}行）",
+                 f"期間: {best['from']} 〜 {best['to']} / {best['n_items']}商品 / ₱{best['total']:,.0f}\n",
+                 "🚗 Grab売れ筋トップ10:"]
+        for i, r in enumerate(best['rows'], 1):
+            lines.append(f"  {i}. {r['item']}: {r['qty']:.0f}点 / ₱{r['amt']:,.0f}")
+        lines.append("\n💡「統合売れ筋」で店頭＋Grabの合算ランキングが出せます")
+        sent = await update.message.reply_text("\n".join(lines))
+        save_bot_message(chat_id, sent.message_id)
+        return
+    if grab_type == 'grab_understocked':
+        count = import_grab_understocked_csv(chat_id, rows)
+        sh = get_grab_understocked_top(chat_id, limit=10)
+        lines = [f"✅ Grab欠品データを取り込みました（{count}行）",
+                 f"期間: {sh['from']} 〜 {sh['to']}",
+                 f"⚠️ 欠品による売り逃し 合計 ₱{sh['total']:,.0f}（{sh['n_items']}商品）\n",
+                 "売り逃しトップ10:"]
+        for i, r in enumerate(sh['rows'], 1):
+            lines.append(f"  {i}. {r['item']}: 欠品{r['short']:.0f}点 / ₱{r['lost']:,.0f}（{r['days']}日）")
+        lines.append("\n💡 次の発注でこれらを優先してください")
+        sent = await update.message.reply_text("\n".join(lines))
+        save_bot_message(chat_id, sent.message_id)
+        return
+    if grab_type == 'grab_transactions':
+        sent = await update.message.reply_text(
+            "ℹ️ これはGrabの取引明細（Finance）ですね。注文単位の金額のみで商品名が入っていないため、"
+            "売れ筋分析には使えません。\n\n"
+            "商品別が欲しい場合は GrabMerchant の\n"
+            "Insights → Menu / Catalogue → Item performance → Download\n"
+            "から落としたCSVを送ってください。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+
     csv_type = detect_utak_csv_type(list(rows[0].keys()))
     if csv_type == 'inventory':
         count = import_utak_inventory_csv(chat_id, rows)
@@ -4276,7 +4575,13 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sent = await update.message.reply_text("\n".join(msg_lines))
         save_bot_message(chat_id, sent.message_id)
     else:
-        sent = await update.message.reply_text("⚠️ UTAKのCSV形式を認識できませんでした。\nInventory CSV または Transactions Details CSV をお送りください。")
+        sent = await update.message.reply_text(
+            "⚠️ CSV形式を認識できませんでした。\n\n"
+            "対応しているCSV:\n"
+            "・UTAK Inventory CSV\n"
+            "・UTAK Transactions Details CSV\n"
+            "・Grab: Insights → Menu/Catalogue → Item performance\n"
+            "・Grab: Insights → Menu/Catalogue → Understocked items")
         save_bot_message(chat_id, sent.message_id)
 
 async def cmd_utak_analysis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4365,6 +4670,82 @@ async def cmd_online_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(f"\n💰 Total: ₱{total_sales:,.0f}")
     sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
+
+async def cmd_grab_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Grabの商品別売れ筋（GrabMerchantのCSV取り込み分）。"""
+    chat_id = update.effective_chat.id
+    best = get_grab_bestsellers(chat_id, limit=20)
+    if not best['rows']:
+        sent = await update.message.reply_text(
+            "Grabの商品別データがまだありません。\n\n"
+            "GrabMerchant → Insights → Menu / Catalogue → 期間を設定 →\n"
+            "Item performance の Download（Excel/CSV）で落として、このチャットに送ってください。\n"
+            "⚠️ Grabのデータは90日で消えるため、月1回の取り込みをおすすめします。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    lines = [f"🚗 Grab 商品別売れ筋", f"期間: {best['from']} 〜 {best['to']}",
+             f"{best['n_items']}商品 / 合計 ₱{best['total']:,.0f}", "━━━━━━━━━━━━━━━━━━━"]
+    for i, r in enumerate(best['rows'], 1):
+        lines.append(f"{i}. {r['item']}\n    {r['qty']:.0f}点 / ₱{r['amt']:,.0f} / {r['days']}日")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_grab_shortage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Grabの欠品による売り逃し。"""
+    chat_id = update.effective_chat.id
+    sh = get_grab_understocked_top(chat_id, limit=20)
+    if not sh['rows']:
+        sent = await update.message.reply_text(
+            "Grabの欠品データがまだありません。\n\n"
+            "GrabMerchant → Insights → Menu / Catalogue → Understocked items の\n"
+            "Download で落としたCSVをこのチャットに送ってください。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    lines = [f"⚠️ Grab 欠品による売り逃し", f"期間: {sh['from']} 〜 {sh['to']}",
+             f"合計 ₱{sh['total']:,.0f} / {sh['n_items']}商品", "━━━━━━━━━━━━━━━━━━━"]
+    for i, r in enumerate(sh['rows'], 1):
+        lines.append(f"{i}. {r['item']}\n    注文{r['ordered']:.0f} / 欠品{r['short']:.0f}点 / "
+                     f"₱{r['lost']:,.0f} / {r['days']}日")
+    lines.append("\n💡 次の発注でこれらを優先してください")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_combined_bestsellers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """店頭 + Grab を合算した売れ筋（カテゴリー別）。"""
+    chat_id = update.effective_chat.id
+    comb = get_combined_bestsellers(chat_id, limit=10)
+    if not comb['cats']:
+        sent = await update.message.reply_text(
+            "統合するにはGrabの商品別データが必要です。\n"
+            "「grab売れ筋」と送ると取り込み手順を案内します。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    MAIN = ['BEVERAGE', 'SNACKS & CANDIES', 'SEASONING', 'CHILLED ITEM', 'FROZEN ITEM']
+    JA = {'BEVERAGE': '飲料', 'SNACKS & CANDIES': 'お菓子', 'SEASONING': '調味料',
+          'CHILLED ITEM': '冷蔵食品', 'FROZEN ITEM': '冷凍食品'}
+    lines = ["📊 統合売れ筋（店頭 + Grab）", f"期間: {comb['from']} 〜 {comb['to']}",
+             "※Grabは90日しか遡れないためこの期間に揃えています"]
+    for cat in MAIN:
+        rows = comb['cats'].get(cat)
+        if not rows:
+            continue
+        t_amt = sum(r['amt'] for r in rows)
+        t_g = sum(r['g_amt'] for r in rows)
+        lines.append(f"\n━━━ {JA.get(cat, cat)} ━━━")
+        lines.append(f"TOP10計 ₱{t_amt:,.0f}（Grab {t_g/t_amt*100:.0f}%）")
+        for i, r in enumerate(rows, 1):
+            lines.append(f"{i}. {r['item']}")
+            lines.append(f"    {r['qty']:.0f}点 / ₱{r['amt']:,.0f}"
+                         f"（店頭₱{r['s_amt']:,.0f} + Grab₱{r['g_amt']:,.0f} = {r['g_pct']:.0f}%）")
+    if comb.get('unmatched'):
+        lines.append("\n※レジに存在しないGrab専用商品（統合対象外）:")
+        for r in comb['unmatched'][:5]:
+            lines.append(f"  • {r['item']}: ₱{r['amt']:,.0f}")
+    text = "\n".join(lines)
+    # Telegramの1メッセージ上限に合わせて分割
+    for i in range(0, len(text), 3800):
+        sent = await update.message.reply_text(text[i:i + 3800])
+        save_bot_message(chat_id, sent.message_id)
 
 async def cmd_hourly_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """時間帯別売れ筋を表示。"""
@@ -4745,6 +5126,53 @@ async def utak_auto_sync(context):
         except Exception:
             pass
 
+async def grab_download_reminder_job(context):
+    """毎月1日に、Grabの商品別データを落として送るようリマインドする。
+    GrabMerchantのデータは90日で消えるため、取り逃すと復元できない。"""
+    now = datetime.now(PHT)
+    if now.day != 1:
+        return
+    chat_id = OWNER_CHAT_ID or REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
+    if not chat_id:
+        return
+    target = resolve_utak_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT MAX(sale_date) FROM grab_sales WHERE chat_id=?', (target,))
+    last = (c.fetchone() or [None])[0]
+    conn.close()
+    gap = ''
+    if last:
+        try:
+            days = (now.date() - datetime.strptime(last, '%Y-%m-%d').date()).days
+            gap = f"\n\n現在のGrabデータは {last} まで（{days}日前）。"
+            if days > 80:
+                gap += "\n⚠️ 90日を過ぎると古い分は取得できなくなります。今月中にお願いします。"
+        except Exception:
+            pass
+    else:
+        gap = "\n\nGrabの商品別データはまだ取り込まれていません。"
+    msg = (
+        "📅 Grabデータの取り込み時期です（毎月1日のお知らせ）\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "GrabMerchant のデータは90日で消えるため、月1回の取り込みが必要です。\n\n"
+        "【手順】\n"
+        "1. merchant.grab.com にログイン\n"
+        "2. Insights → Menu / Catalogue\n"
+        "3. 期間を先に設定（できるだけ長く／最大90日）\n"
+        "4. All Grab services を GrabMart / GrabFood それぞれで\n"
+        "5. Item performance の Download\n"
+        "6. Understocked items も Download\n"
+        "7. 落としたCSVをこのチャットに送る（自動で取り込みます）\n\n"
+        "取り込み後は「統合売れ筋」「grab売れ筋」「欠品」で分析できます。"
+        + gap
+    )
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+        logger.info("Grab download reminder sent")
+    except Exception as e:
+        logger.error(f"Grab reminder failed: {e}")
+
 def _is_tuesday_before_1st_or_3rd_wednesday() -> bool:
     """今日が第1水曜または第3水曜の前日（火曜）かどうか判定。"""
     today = datetime.now(PHT).date()
@@ -4889,6 +5317,13 @@ def main():
             name='auto_reorder',
         )
         logger.info("Auto reorder scheduled: Tue 20:00 PHT before 1st/3rd Wed")
+        # Grab data download reminder: daily 09:00 PHT check (fires only on the 1st)
+        app.job_queue.run_daily(
+            grab_download_reminder_job,
+            time=dtime(9, 0, tzinfo=PHT),
+            name='grab_download_reminder',
+        )
+        logger.info("Grab download reminder scheduled: 1st of month 09:00 PHT")
     elif not WEEKLY_REPORT_CHAT_ID:
         logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
