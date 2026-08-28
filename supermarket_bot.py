@@ -5394,16 +5394,17 @@ async def grab_download_reminder_job(context):
     msg = (
         "📅 Grabデータの取り込み時期です（毎月1日のお知らせ）\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "GrabMerchant のデータは90日で消えるため、月1回の取り込みが必要です。\n\n"
+        "GrabMerchant のデータは90日で消えるため、月1回の取得が必要です。\n\n"
         "【手順】\n"
         "1. merchant.grab.com にログイン\n"
         "2. Insights → Menu / Catalogue\n"
         "3. 期間を先に設定（できるだけ長く／最大90日）\n"
-        "4. All Grab services を GrabMart / GrabFood それぞれで\n"
-        "5. Item performance の Download\n"
-        "6. Understocked items も Download\n"
-        "7. 落としたCSVをこのチャットに送る（自動で取り込みます）\n\n"
-        "取り込み後は「統合売れ筋」「grab売れ筋」「欠品」で分析できます。"
+        "4. Item performance の Download\n"
+        "5. Understocked items も Download\n"
+        "6. 落としたCSVを C:\\Users\\smaed\\midori-mart\\grab に保存\n"
+        "   → Claudeに「Grabのデータ入れた」と伝えれば分析します\n\n"
+        "※このチャットにCSVを送っても自動で取り込めます（その場でサマリーを返信）。\n"
+        "　取り込み後は「統合売れ筋」「grab売れ筋」「欠品」でも見られます。"
         + gap
     )
     try:
