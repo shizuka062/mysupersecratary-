@@ -13,6 +13,7 @@ import asyncio
 import logging
 import pathlib
 import calendar
+import collections
 import math
 from datetime import datetime, timedelta, time as dtime, timezone
 from typing import Optional
@@ -701,10 +702,18 @@ def import_utak_inventory_csv(chat_id: int, rows: list[dict]) -> int:
     return count
 
 def import_utak_sales_csv(chat_id: int, rows: list[dict]) -> int:
-    """UTAK売上CSVをDBにインポート。戻り値は取り込み件数。"""
+    """UTAK売上CSVをDBにインポート。戻り値は取り込み件数。
+
+    utak_sales にはUNIQUE制約が無いため、同じCSVを2回取り込むと全行が重複する
+    （2026-09-02 に過去8日分の重複が判明）。既に同一の明細がある行は飛ばす。
+    同一判定 = chat_id + 日付 + 取引ID + 商品名 + 時刻 + 金額 + 数量。
+    同じ商品を2行に分けて打つ正常なケースを消さないよう、
+    既存の行数を超える分だけを挿入する。"""
     conn = get_conn()
     c = conn.cursor()
     count = 0
+    skipped = 0
+    seen = collections.Counter()
     for r in rows:
         cat = r.get('Category', '').strip()
         item = r.get('Item', '').strip()
@@ -718,6 +727,17 @@ def import_utak_sales_csv(chat_id: int, rows: list[dict]) -> int:
             sale_date = raw_date
         qty = _parse_float(r.get('Quantity', ''))
         if qty == 0:
+            continue
+        # 同じ明細がDBに何行あるか調べ、このCSV内での出現回数を超えていれば重複と判断
+        key = (sale_date, r.get('Transaction ID', '').strip(), item,
+               r.get('Time', '').strip(), _parse_float(r.get('Gross Price', '')), qty)
+        seen[key] += 1
+        c.execute('''SELECT COUNT(*) FROM utak_sales
+                     WHERE chat_id=? AND sale_date=? AND transaction_id=? AND item_name=?
+                       AND sale_time=? AND gross_price=? AND qty=?''',
+                  (chat_id,) + key)
+        if c.fetchone()[0] >= seen[key]:
+            skipped += 1
             continue
         c.execute('''INSERT INTO utak_sales
                      (chat_id, sale_date, sale_time, transaction_id, receipt_no, total,
@@ -734,6 +754,9 @@ def import_utak_sales_csv(chat_id: int, rows: list[dict]) -> int:
         count += 1
     conn.commit()
     conn.close()
+    if skipped:
+        logger.warning(f"import_utak_sales_csv: skipped {skipped} duplicate rows "
+                       f"(already in DB), imported {count}")
     return count
 
 # ─── Grab (GrabMerchant Insights) ──────────────────────────
@@ -5467,9 +5490,11 @@ async def auto_reorder_job(context):
     if not chat_id:
         return
     logger.info("Auto reorder: generating procurement list...")
-    # まずUTAKデータを最新に同期（もしcredentialがあれば）
-    if UTAK_EMAIL and UTAK_PASSWORD:
-        await utak_auto_sync(context)
+    # ここで utak_auto_sync を呼ばない。
+    # 同じ日の深夜1時に前日分を取り込み済みなので、20時に再度呼ぶと
+    # 同じ売上CSVをもう一度取り込んでしまい、その日（＝前日の月曜）の
+    # 売上が丸ごと2倍になっていた（2026-09-02 に判明・過去8日分で発生）。
+    # 在庫・売上は1時の同期で十分新しい。
     reorder = get_utak_reorder_list(chat_id)
     if not reorder:
         await context.bot.send_message(chat_id=chat_id, text="📋 仕入れリスト自動生成: UTAKデータが不足しています。")
