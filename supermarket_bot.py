@@ -2668,19 +2668,30 @@ def _is_sunday(date_str: str) -> bool:
     except Exception:
         return False
 
-def _recent_baseline(chat_id: int, date_str: str, days: int = 7) -> dict:
-    """当日より前の直近N日の平均（売上・客数）を返す。
-    前日比だけで判定すると、良い日の翌日に必ずアラートが出てしまうため
-    （日々の売上は₱14,000〜₱31,000で普通に上下する）、平均を基準にする。"""
+def _median(vals: list) -> float:
+    v = sorted(x for x in vals if x)
+    if not v:
+        return 0.0
+    m = len(v) // 2
+    return float(v[m]) if len(v) % 2 else (v[m - 1] + v[m]) / 2.0
+
+def _recent_baseline(chat_id: int, date_str: str, days: int = 14) -> dict:
+    """当日より前の直近N日の「中央値」（売上・客数）を返す。
+
+    前日比だけで判定すると良い日の翌日に必ず鳴るため基準を平均に変えたが、
+    平均だと1日の飛び値に引っ張られる。実際 2026-08-22 の₱71,372（通常の3倍）
+    が平均を₱31,000まで押し上げ、その後1週間ずっと誤報が続いた。
+    中央値なら飛び値の影響を受けない。"""
     conn = get_conn()
     c = conn.cursor()
-    c.execute('''SELECT AVG(total), AVG(NULLIF(transaction_count,0)), COUNT(*)
-                 FROM (SELECT total, transaction_count FROM supermarket_sales
-                       WHERE chat_id=? AND date<? AND total>0
-                       ORDER BY date DESC LIMIT ?)''', (chat_id, date_str, days))
-    r = c.fetchone()
+    c.execute('''SELECT total, transaction_count FROM supermarket_sales
+                 WHERE chat_id=? AND date<? AND total>0
+                 ORDER BY date DESC LIMIT ?''', (chat_id, date_str, days))
+    rows = c.fetchall()
     conn.close()
-    return {'total': r[0] or 0, 'tx': r[1] or 0, 'n': r[2] or 0}
+    return {'total': _median([r[0] for r in rows]),
+            'tx': _median([r[1] for r in rows]),
+            'n': len(rows)}
 
 def check_alerts(data: dict, prev: Optional[dict], chat_id: int = 0) -> list:
     alerts = []
@@ -2692,13 +2703,13 @@ def check_alerts(data: dict, prev: Optional[dict], chat_id: int = 0) -> list:
     if base['n'] >= 3 and base['total'] > 0:
         pct = (data['total'] - base['total']) / base['total'] * 100
         if pct <= -25:
-            alerts.append(f"⚠️ 直近{base['n']}日平均比{pct:+.1f}%"
-                          f"（平均₱{base['total']:,.0f}）：要因確認を推奨")
+            alerts.append(f"⚠️ 通常より{pct:+.1f}%"
+                          f"（直近{base['n']}日の中央値 ₱{base['total']:,.0f}）：要因確認を推奨")
         if base['tx'] > 0 and data.get('transaction_count', 0) > 0:
             tx_pct = (data['transaction_count'] - base['tx']) / base['tx'] * 100
             if tx_pct <= -25:
-                alerts.append(f"👥 客数が直近平均比{tx_pct:+.1f}%"
-                              f"（平均{base['tx']:.0f}件）：プロモーション検討を推奨")
+                alerts.append(f"👥 客数が通常より{tx_pct:+.1f}%"
+                              f"（中央値{base['tx']:.0f}件）：プロモーション検討を推奨")
 
     if prev and prev['total'] > 0:
         # GYアラートは金〜日のみ（月〜木はGraveyardシフトなし）
