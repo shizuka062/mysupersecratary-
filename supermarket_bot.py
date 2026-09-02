@@ -5234,11 +5234,11 @@ async def utak_auto_sync(context):
                 alert += f"\n\n🔴 URGENT — selling fast, low stock: {len(urgent)} items"
                 for it in urgent[:8]:
                     stock_str = f"{it['stock']:.0f} left" if it['stock'] > 0 else "OUT OF STOCK"
-                    alert += f"\n  • {it['item_name']}: {stock_str} ({it['daily_rate']:.1f}/day, {it['days_left']:.0f}d left)"
+                    alert += f"\n  • {it['item_name']}: {stock_str} ({it['daily_rate']:.1f}/day, {it['days_left']:.1f}d left)"
             if warning:
                 alert += f"\n\n🟡 WARNING — restock within 7 days: {len(warning)} items"
                 for it in warning[:8]:
-                    alert += f"\n  • {it['item_name']}: {it['stock']:.0f} left ({it['days_left']:.0f}d)"
+                    alert += f"\n  • {it['item_name']}: {it['stock']:.0f} left ({it['days_left']:.1f}d)"
             await context.bot.send_message(chat_id=chat_id, text=alert)
     except Exception as e:
         logger.error(f"UTAK auto-sync failed: {e}")
@@ -5585,12 +5585,12 @@ async def _auto_reorder_job_inner(context):
         for it in urgent[:20]:
             stock_str = f"{it['stock']:.0f} left" if it['stock'] > 0 else "OUT OF STOCK"
             lines.append(f"  • {it['item_name']} ({it['category']})")
-            lines.append(f"    {stock_str} | {it['daily_rate']:.1f}/day | {it['days_left']:.0f} days left")
+            lines.append(f"    {stock_str} | {it['daily_rate']:.1f}/day | {it['days_left']:.1f} days left")
     if warning:
         lines.append(f"\n🟡 WARNING (runs out within 7 days): {len(warning)} items")
         for it in warning[:20]:
             lines.append(f"  • {it['item_name']} ({it['category']})")
-            lines.append(f"    {it['stock']:.0f} left | {it['daily_rate']:.1f}/day | {it['days_left']:.0f} days left")
+            lines.append(f"    {it['stock']:.0f} left | {it['daily_rate']:.1f}/day | {it['days_left']:.1f} days left")
     if normal:
         lines.append(f"\n🟢 Regular restock: {len(normal)} items")
         for it in normal[:15]:
@@ -5641,7 +5641,7 @@ async def _auto_reorder_job_inner(context):
             note = (note + ' / ' if note else '') + 'CHECK EXPIRY'
         writer.writerow([it['priority'], it['category'], it['item_name'],
                          f"{it['stock']:.0f}", f"{it['daily_rate']:.1f}",
-                         f"{it['days_left']:.0f}" if it['days_left'] < 999 else '-',
+                         f"{it['days_left']:.1f}" if it['days_left'] < 999 else '-',
                          f"{it['total_sold_14d']:.0f}", f"{it.get('grab_qty_60', 0):.0f}",
                          f"{need:.0f}", target_days, note])
     csv_bytes = csv_buf.getvalue().encode('utf-8-sig')
