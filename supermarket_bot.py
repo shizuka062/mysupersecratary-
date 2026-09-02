@@ -2668,6 +2668,29 @@ def _is_sunday(date_str: str) -> bool:
     except Exception:
         return False
 
+def _split_lines(lines: list, limit: int = 3800) -> list:
+    """行のリストを、Telegramの上限に収まる複数のメッセージに分割する。
+    文字数で機械的に切ると行の途中で分断されて読みづらいため
+    （例:「...Biscuits – 63g: 1 lef」/「t | 0.1/day」）、行単位で詰める。
+    1行が単独で上限を超える場合だけ、その行を文字数で切る。"""
+    out, buf, size = [], [], 0
+    for ln in lines:
+        ln = str(ln)
+        if len(ln) > limit:              # 極端に長い1行はやむなく文字数で切る
+            if buf:
+                out.append("\n".join(buf)); buf, size = [], 0
+            for i in range(0, len(ln), limit):
+                out.append(ln[i:i + limit])
+            continue
+        add = len(ln) + (1 if buf else 0)
+        if size + add > limit:
+            out.append("\n".join(buf)); buf, size = [ln], len(ln)
+        else:
+            buf.append(ln); size += add
+    if buf:
+        out.append("\n".join(buf))
+    return out or [""]
+
 def _median(vals: list) -> float:
     v = sorted(x for x in vals if x)
     if not v:
@@ -4835,10 +4858,9 @@ async def cmd_combined_bestsellers(update: Update, ctx: ContextTypes.DEFAULT_TYP
         lines.append("\n※レジに存在しないGrab専用商品（統合対象外）:")
         for r in comb['unmatched'][:5]:
             lines.append(f"  • {r['item']}: ₱{r['amt']:,.0f}")
-    text = "\n".join(lines)
-    # Telegramの1メッセージ上限に合わせて分割
-    for i in range(0, len(text), 3800):
-        sent = await update.message.reply_text(text[i:i + 3800])
+    # Telegramの1メッセージ上限に合わせて、行単位で分割（行の途中で切らない）
+    for chunk in _split_lines(lines):
+        sent = await update.message.reply_text(chunk)
         save_bot_message(chat_id, sent.message_id)
 
 async def cmd_hourly_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5578,11 +5600,10 @@ async def _auto_reorder_job_inner(context):
         lines.append(f"   ⚠️ {len(chilled)} chilled items - check expiry dates before increasing quantity.")
     # Telegramの1メッセージ上限は4096文字。超えると送信が失敗し、
     # 以降のCSV添付まで届かなくなる（2026-09-01の発注リストで実際に発生）。
-    # 安全な長さに分割し、1通失敗しても残りとCSVは送れるようにする。
-    _text = "\n".join(lines)
-    for _i in range(0, len(_text), 3800):
+    # 行の途中で切れると読みづらいので、行単位で詰めて分割する。
+    for _chunk in _split_lines(lines):
         try:
-            await context.bot.send_message(chat_id=chat_id, text=_text[_i:_i + 3800])
+            await context.bot.send_message(chat_id=chat_id, text=_chunk)
         except Exception as e:
             logger.error(f"Auto reorder: message send failed: {e}")
     # CSV (English headers)
