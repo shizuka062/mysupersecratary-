@@ -2668,21 +2668,39 @@ def _is_sunday(date_str: str) -> bool:
     except Exception:
         return False
 
-def check_alerts(data: dict, prev: Optional[dict]) -> list:
+def _recent_baseline(chat_id: int, date_str: str, days: int = 7) -> dict:
+    """当日より前の直近N日の平均（売上・客数）を返す。
+    前日比だけで判定すると、良い日の翌日に必ずアラートが出てしまうため
+    （日々の売上は₱14,000〜₱31,000で普通に上下する）、平均を基準にする。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT AVG(total), AVG(NULLIF(transaction_count,0)), COUNT(*)
+                 FROM (SELECT total, transaction_count FROM supermarket_sales
+                       WHERE chat_id=? AND date<? AND total>0
+                       ORDER BY date DESC LIMIT ?)''', (chat_id, date_str, days))
+    r = c.fetchone()
+    conn.close()
+    return {'total': r[0] or 0, 'tx': r[1] or 0, 'n': r[2] or 0}
+
+def check_alerts(data: dict, prev: Optional[dict], chat_id: int = 0) -> list:
     alerts = []
     total = data['total'] if data['total'] > 0 else 1
     has_gy = _has_graveyard_shift(data['date'])
 
+    # 売上・客数は「直近7日平均」と比べる（前日比は振れ幅が大きく誤報が多い）
+    base = _recent_baseline(chat_id, data['date'])
+    if base['n'] >= 3 and base['total'] > 0:
+        pct = (data['total'] - base['total']) / base['total'] * 100
+        if pct <= -25:
+            alerts.append(f"⚠️ 直近{base['n']}日平均比{pct:+.1f}%"
+                          f"（平均₱{base['total']:,.0f}）：要因確認を推奨")
+        if base['tx'] > 0 and data.get('transaction_count', 0) > 0:
+            tx_pct = (data['transaction_count'] - base['tx']) / base['tx'] * 100
+            if tx_pct <= -25:
+                alerts.append(f"👥 客数が直近平均比{tx_pct:+.1f}%"
+                              f"（平均{base['tx']:.0f}件）：プロモーション検討を推奨")
+
     if prev and prev['total'] > 0:
-        pct = (data['total'] - prev['total']) / prev['total'] * 100
-        if pct <= -15:
-            alerts.append(f"⚠️ 前日比{pct:+.1f}%：要因確認を推奨（天候/イベント影響？）")
-
-        if prev.get('transaction_count', 0) > 0:
-            tx_pct = (data['transaction_count'] - prev['transaction_count']) / prev['transaction_count'] * 100
-            if tx_pct <= -20:
-                alerts.append(f"👥 客数減{tx_pct:+.1f}%：プロモーション検討を推奨")
-
         # GYアラートは金〜日のみ（月〜木はGraveyardシフトなし）
         if has_gy and prev.get('graveyard', 0) > 0:
             g_pct = (data['graveyard'] - prev['graveyard']) / prev['graveyard'] * 100
@@ -4027,7 +4045,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"check_sales_anomaly error: {e}", exc_info=True)
             try:
-                alerts = check_alerts(data, prev)
+                alerts = check_alerts(data, prev, chat_id)
             except Exception as e:
                 logger.error(f"check_alerts error: {e}", exc_info=True)
                 alerts = []
