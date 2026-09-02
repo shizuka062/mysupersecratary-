@@ -1545,15 +1545,20 @@ def get_utak_reorder_list(chat_id: int) -> list[dict]:
         else:
             days_left = 999  # not selling, no urgency
         # Priority: 🔴 urgent (<=2 days), 🟡 warning (<=7 days), 🟢 normal
-        if days_left <= 2:
+        # 在庫マイナスは「在庫データが合っていない」ので別枠(⚪)にする。
+        # 入荷登録をしていない商品（店内製造のおにぎり・弁当・アイス、バラ売り、
+        # パン、シオパオ等）は売れるたびにマイナスが積み上がり、常にOUT OF STOCKと
+        # 出てしまう。2026-09-02時点で🔴46品のうち39品(85%)がこれで、
+        # 本当に緊急な7品が埋もれていた。→ 現物確認に回す。
+        if stock < 0:
+            priority = '⚪'
+            priority_score = 3
+        elif days_left <= 2:
             priority = '🔴'
             priority_score = 0
         elif days_left <= 7:
             priority = '🟡'
             priority_score = 1
-        elif stock <= 0 and sale['total_qty'] > 0:
-            priority = '🔴'
-            priority_score = 0
         else:
             priority = '🟢'
             priority_score = 2
@@ -5574,6 +5579,7 @@ async def _auto_reorder_job_inner(context):
     urgent = [r for r in reorder if r['priority'] == '🔴']
     warning = [r for r in reorder if r['priority'] == '🟡']
     normal = [r for r in reorder if r['priority'] == '🟢']
+    unreliable = [r for r in reorder if r['priority'] == '⚪']
     if urgent:
         lines.append(f"\n🔴 URGENT (out of stock soon): {len(urgent)} items")
         for it in urgent[:20]:
@@ -5591,7 +5597,18 @@ async def _auto_reorder_job_inner(context):
             lines.append(f"  • {it['item_name']}: {it['stock']:.0f} left | {it['daily_rate']:.1f}/day")
         if len(normal) > 15:
             lines.append(f"  ...and {len(normal)-15} more (see CSV)")
-    lines.append(f"\nTotal: 🔴{len(urgent)} + 🟡{len(warning)} + 🟢{len(normal)} = {len(reorder)} items")
+    if unreliable:
+        lines.append(f"\n⚪ STOCK DATA UNRELIABLE (negative stock): {len(unreliable)} items")
+        lines.append("   These are items where receipts are not registered in the POS")
+        lines.append("   (in-store made onigiri/bento/ice cream, single-piece sales, bread,")
+        lines.append("   siopao). Stock goes negative every time they sell, so the number")
+        lines.append("   is meaningless. PLEASE CHECK THE ACTUAL SHELF for these.")
+        for it in unreliable[:12]:
+            lines.append(f"  • {it['item_name']} ({it['category']}): shows {it['stock']:.0f} | {it['daily_rate']:.1f}/day")
+        if len(unreliable) > 12:
+            lines.append(f"  ...and {len(unreliable)-12} more (see CSV)")
+    lines.append(f"\nTotal: 🔴{len(urgent)} + 🟡{len(warning)} + 🟢{len(normal)}"
+                 f" + ⚪{len(unreliable)} = {len(reorder)} items")
     grab_heavy = [r for r in reorder if r.get('grab_qty_60', 0) > 0]
     lines.append(f"\n📌 Daily sales now INCLUDE Grab orders ({len(grab_heavy)} items have Grab demand).")
     lines.append("   Suggested order quantity is in the CSV (22-day target; 16 days for CHILLED).")
@@ -5619,7 +5636,7 @@ async def _auto_reorder_job_inner(context):
         # 在庫マイナスをそのまま引くと過剰発注になる（バラ売り・店内製造品は構造的にマイナス）。
         # 判定ルール第5条に合わせ、マイナス在庫は0として扱い、現物確認のフラグを立てる。
         need = max(0, math.ceil(it['daily_rate'] * target_days) - max(it['stock'], 0))
-        note = 'CHECK ACTUAL STOCK (negative)' if it['stock'] < 0 else ''
+        note = 'STOCK DATA UNRELIABLE - CHECK ACTUAL SHELF' if it['stock'] < 0 else ''
         if it['category'] == 'CHILLED ITEM':
             note = (note + ' / ' if note else '') + 'CHECK EXPIRY'
         writer.writerow([it['priority'], it['category'], it['item_name'],
