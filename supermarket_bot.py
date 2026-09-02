@@ -5483,7 +5483,22 @@ def _is_tuesday_before_1st_or_3rd_wednesday() -> bool:
 REORDER_CHAT_ID = -4845840580
 
 async def auto_reorder_job(context):
-    """第1・第3水曜の前日火曜に自動仕入れリストを生成・送信。"""
+    """第1・第3水曜の前日火曜に自動仕入れリストを生成・送信。
+    途中で例外が出ると静かに何も届かなくなるため（2026-09-01に発生）、
+    全体を包んで失敗を通知する。"""
+    try:
+        await _auto_reorder_job_inner(context)
+    except Exception as e:
+        logger.error(f"auto_reorder_job failed: {e}", exc_info=True)
+        try:
+            await context.bot.send_message(
+                chat_id=REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID,
+                text=f"❌ 発注リストの自動生成に失敗しました\n{type(e).__name__}: {e}\n\n"
+                     "「在庫分析」で手動生成できます。")
+        except Exception:
+            pass
+
+async def _auto_reorder_job_inner(context):
     if not _is_tuesday_before_1st_or_3rd_wednesday():
         return
     chat_id = REORDER_CHAT_ID
@@ -5532,7 +5547,15 @@ async def auto_reorder_job(context):
     chilled = [r for r in reorder if r['category'] == 'CHILLED ITEM']
     if chilled:
         lines.append(f"   ⚠️ {len(chilled)} chilled items - check expiry dates before increasing quantity.")
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    # Telegramの1メッセージ上限は4096文字。超えると送信が失敗し、
+    # 以降のCSV添付まで届かなくなる（2026-09-01の発注リストで実際に発生）。
+    # 安全な長さに分割し、1通失敗しても残りとCSVは送れるようにする。
+    _text = "\n".join(lines)
+    for _i in range(0, len(_text), 3800):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=_text[_i:_i + 3800])
+        except Exception as e:
+            logger.error(f"Auto reorder: message send failed: {e}")
     # CSV (English headers)
     csv_buf = io.StringIO()
     csv_buf.write('\ufeff')
