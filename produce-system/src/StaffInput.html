@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0; padding: 0; background: #f1f3f4; color: #202124;
+    }
+    header {
+      background: #34a853; color: #fff; padding: 16px; position: sticky; top: 0; z-index: 10;
+    }
+    header h1 { margin: 0; font-size: 18px; }
+    header p { margin: 4px 0 0; font-size: 13px; opacity: .9; }
+    .staff {
+      padding: 12px 16px; background: #fff; border-bottom: 1px solid #ddd;
+    }
+    .staff label { font-size: 13px; color: #555; display: block; margin-bottom: 4px; }
+    .staff input {
+      width: 100%; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 8px;
+    }
+    .list { padding: 8px 12px 8px; }
+    .giftHead { padding: 16px 16px 6px; font-size: 16px; font-weight: 700; color: #7b1fa2; }
+    .giftItem { background: #fff; border-radius: 10px; padding: 12px 14px; margin: 0 12px 8px; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+    .giftName { font-size: 16px; font-weight: 700; }
+    .giftEn { font-size: 14px; color: #444; margin: 4px 0 10px; line-height: 1.4; }
+    .giftInputWrap { display: flex; align-items: center; gap: 10px; }
+    .giftQty { width: 90px; padding: 10px; font-size: 19px; text-align: center; border: 2px solid #a142f4; border-radius: 8px; }
+    .giftInputWrap .lbl { font-size: 13px; color: #555; }
+    .item {
+      background: #fff; border-radius: 10px; padding: 12px 14px; margin-bottom: 8px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.08);
+    }
+    .item .name { font-size: 16px; font-weight: 600; }
+    .item .meta { font-size: 12px; color: #777; margin-top: 2px; }
+    .item .fields { display: flex; gap: 8px; margin-top: 8px; }
+    .item .field { display: flex; flex-direction: column; align-items: center; flex: 1; }
+    .item .field .lbl { font-size: 11px; color: #777; margin-top: 3px; }
+    .item .field input {
+      width: 100%; padding: 10px 4px; font-size: 19px; text-align: center;
+      border: 2px solid #ccc; border-radius: 8px;
+    }
+    .item .field input.qty { border-color: #34a853; }
+    .item .field input.waste { border-color: #d93025; }
+    .item .field input.tasting { border-color: #1a73e8; }
+    .item .field input.baked { border-color: #e8710a; }
+    .footer {
+      position: fixed; bottom: 0; left: 0; right: 0; padding: 12px 16px;
+      background: #fff; border-top: 1px solid #ddd; box-shadow: 0 -2px 8px rgba(0,0,0,.06);
+    }
+    button {
+      width: 100%; padding: 16px; font-size: 18px; font-weight: 700; color: #fff;
+      background: #34a853; border: none; border-radius: 10px;
+    }
+    button:disabled { background: #9aa0a6; }
+    .toast {
+      position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%);
+      background: #202124; color: #fff; padding: 12px 20px; border-radius: 24px;
+      font-size: 15px; opacity: 0; transition: opacity .3s; z-index: 20;
+    }
+    .toast.show { opacity: 1; }
+    .loading { text-align: center; padding: 40px; color: #777; }
+    .modal-bg {
+      position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 50;
+      display: none; align-items: center; justify-content: center; padding: 16px;
+    }
+    .modal-bg.show { display: flex; }
+    .modal {
+      background: #fff; border-radius: 12px; width: 100%; max-width: 460px;
+      max-height: 82vh; overflow: auto; padding: 20px;
+    }
+    .modal h2 { margin: 0 0 10px; font-size: 18px; }
+    .modal .summary { font-size: 15px; color: #202124; margin-bottom: 12px; line-height: 1.5; }
+    .modal .warn {
+      background: #fef7e0; border: 1px solid #f9ab00; border-radius: 8px;
+      padding: 10px 12px; font-size: 14px; margin-bottom: 8px; line-height: 1.4;
+    }
+    .modal .warn.bad { background: #fce8e6; border-color: #d93025; }
+    .modal .warn.ok { background: #e6f4ea; border-color: #34a853; }
+    .modal .btns { display: flex; gap: 10px; margin-top: 14px; }
+    .modal .btns button { flex: 1; padding: 14px; font-size: 16px; }
+    .modal .btn-back { background: #5f6368; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🥬 Midori No Mart — Daily Stock</h1>
+    <p>Stock = quantity LEFT. Waste = thrown away. Tasting = used for sampling.</p>
+  </header>
+
+  <div class="staff">
+    <label>Date (you can choose a past date)</label>
+    <input id="date" type="date">
+    <div style="height:10px"></div>
+    <label>Your name (staff)</label>
+    <input id="staff" type="text" placeholder="e.g. Maria" autocomplete="off">
+  </div>
+
+  <div id="list" class="list">
+    <div class="loading">Loading products…</div>
+  </div>
+
+  <div id="giftSection" style="display:none;">
+    <div class="giftHead">🎁 Gift Boxes — how many SOLD today?</div>
+    <div id="giftList"></div>
+  </div>
+
+  <div style="height:110px;"></div>
+
+  <div class="footer">
+    <button id="saveBtn" onclick="save()" disabled>Save today's stock</button>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <div id="modalBg" class="modal-bg">
+    <div class="modal">
+      <h2>⚠️ Please check before saving</h2>
+      <div id="modalSummary" class="summary"></div>
+      <div id="modalWarn"></div>
+      <div class="btns">
+        <button class="btn-back" onclick="closeModal()">← Back &amp; check</button>
+        <button onclick="doSubmit()">✓ Yes, save</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    var PRODUCTS = [];
+    var GIFTS = [];
+
+    function load() {
+      google.script.run.withSuccessHandler(render).withFailureHandler(onErr).getProductList();
+    }
+
+    function loadGifts() {
+      google.script.run.withSuccessHandler(renderGifts).getGiftList();
+    }
+
+    function renderGifts(gifts) {
+      GIFTS = gifts || [];
+      if (!GIFTS.length) return;
+      var html = '';
+      GIFTS.forEach(function (g, i) {
+        html += '<div class="giftItem" style="border-left:6px solid ' + g.accent + '">' +
+          '<div class="giftName">' + esc(g.label) + ' — ' + g.price + ' PHP</div>' +
+          '<div class="giftEn">' + g.en + '</div>' +
+          '<div class="giftInputWrap">' +
+            '<input class="giftQty" id="g' + i + '" type="number" inputmode="numeric" min="0" placeholder="0">' +
+            '<span class="lbl">Sold today</span>' +
+          '</div>' +
+        '</div>';
+      });
+      document.getElementById('giftList').innerHTML = html;
+      document.getElementById('giftSection').style.display = 'block';
+    }
+
+    function render(products) {
+      PRODUCTS = products;
+      var html = '';
+      products.forEach(function (p, i) {
+        var last = (p.lastStock === '' || p.lastStock === null) ? '—' : p.lastStock;
+        var bakedField = '';
+        if (p.processTo) {
+          bakedField =
+            '<div class="field">' +
+              '<input class="baked" id="b' + i + '" type="number" inputmode="numeric" min="0" placeholder="0">' +
+              '<span class="lbl">Baked</span>' +
+            '</div>';
+        }
+        html += '<div class="item">' +
+          '<div class="name">' + esc(p.nameEN) + '</div>' +
+          '<div class="meta">Last: ' + last + ' (' + esc(p.unit) + ')</div>' +
+          '<div class="fields">' +
+            '<div class="field">' +
+              '<input class="qty" id="q' + i + '" type="number" inputmode="numeric" min="0" placeholder="' + last + '">' +
+              '<span class="lbl">Stock</span>' +
+            '</div>' +
+            '<div class="field">' +
+              '<input class="waste" id="w' + i + '" type="number" inputmode="numeric" min="0" placeholder="0">' +
+              '<span class="lbl">Waste</span>' +
+            '</div>' +
+            '<div class="field">' +
+              '<input class="tasting" id="t' + i + '" type="number" inputmode="numeric" min="0" placeholder="0">' +
+              '<span class="lbl">Tasting</span>' +
+            '</div>' +
+            bakedField +
+          '</div>' +
+        '</div>';
+      });
+      document.getElementById('list').innerHTML = html;
+      document.getElementById('saveBtn').disabled = false;
+    }
+
+    var PENDING = null; // 確認待ちの保存内容
+
+    // Saveボタン → まず確認画面を出す
+    function save() {
+      var staff = document.getElementById('staff').value.trim();
+      if (!staff) { toast('Please enter your name first'); return; }
+      var dateStr = document.getElementById('date').value;
+      if (!dateStr) { toast('Please choose a date'); return; }
+
+      var list = [];
+      var stockCount = 0;
+      var warnings = [];
+      PRODUCTS.forEach(function (p, i) {
+        var v = document.getElementById('q' + i).value;
+        var w = document.getElementById('w' + i).value;
+        var t = document.getElementById('t' + i).value;
+        var bEl = document.getElementById('b' + i);
+        var b = bEl ? bEl.value : '';
+        var hasStock = (v !== '' && v !== null);
+        var hasWaste = (w !== '' && w !== null && Number(w) > 0);
+        var hasTasting = (t !== '' && t !== null && Number(t) > 0);
+        var hasBaked = (b !== '' && b !== null && Number(b) > 0);
+        if (hasStock) {
+          stockCount++;
+          // 在庫が前回より増えている＝入力ミスの可能性（入荷した時だけ正しい）
+          if (p.lastStock !== '' && p.lastStock !== null && Number(v) > Number(p.lastStock)) {
+            warnings.push(esc(p.nameEN) + ': you entered ' + v +
+              ' (MORE than last ' + p.lastStock + ')');
+          }
+        }
+        if (hasStock || hasWaste || hasTasting || hasBaked) {
+          list.push({
+            name: p.name,
+            stock: hasStock ? Number(v) : '',
+            waste: hasWaste ? Number(w) : '',
+            tasting: hasTasting ? Number(t) : '',
+            baked: hasBaked ? Number(b) : ''
+          });
+        }
+      });
+      // ギフト販売数を集める
+      var giftPayload = [];
+      var giftLines = [];
+      GIFTS.forEach(function (g, i) {
+        var el = document.getElementById('g' + i);
+        var gv = el ? el.value : '';
+        if (gv !== '' && gv !== null && Number(gv) > 0) {
+          giftPayload.push({ name: g.name, sold: Number(gv) });
+          giftLines.push(esc(g.label) + ' × ' + Number(gv));
+        }
+      });
+
+      if (list.length === 0 && giftPayload.length === 0) {
+        toast('Please enter at least one quantity'); return;
+      }
+
+      PENDING = { list: list, staff: staff, dateStr: dateStr, gifts: giftPayload };
+
+      // 確認画面を組み立てる
+      var total = PRODUCTS.length;
+      var summary =
+        'Date: <b>' + dateStr + '</b><br>' +
+        'Staff: <b>' + esc(staff) + '</b><br>' +
+        'Stock entered for <b>' + stockCount + ' of ' + total + '</b> items.';
+      if (giftLines.length) {
+        summary += '<br>🎁 Gifts sold: <b>' + giftLines.join(', ') + '</b>';
+      }
+      document.getElementById('modalSummary').innerHTML = summary;
+
+      var wh = '';
+      if (stockCount < total) {
+        wh += '<div class="warn bad">⚠️ <b>' + (total - stockCount) +
+          ' item(s) have NO Stock entered.</b> Their stock will stay unchanged. ' +
+          'Did you count EVERY item today?</div>';
+      }
+      warnings.forEach(function (msg) {
+        wh += '<div class="warn">⚠️ ' + msg + ' — did you restock? If not, please fix.</div>';
+      });
+      if (!wh) {
+        wh = '<div class="warn ok">✓ All ' + total + ' items entered. Looks good!</div>';
+      }
+      document.getElementById('modalWarn').innerHTML = wh;
+      document.getElementById('modalBg').classList.add('show');
+    }
+
+    function closeModal() {
+      document.getElementById('modalBg').classList.remove('show');
+    }
+
+    // 確認画面で「Yes, save」→ 実際に保存
+    function doSubmit() {
+      if (!PENDING) return;
+      closeModal();
+      var p = PENDING; PENDING = null;
+      var btn = document.getElementById('saveBtn');
+      btn.disabled = true; btn.textContent = 'Saving…';
+      google.script.run
+        .withSuccessHandler(function (n) {
+          btn.textContent = 'Save today\'s stock'; btn.disabled = false;
+          toast('Saved ' + n + ' items. Thank you!');
+          PRODUCTS.forEach(function (pp, i) {
+            document.getElementById('q' + i).value = '';
+            document.getElementById('w' + i).value = '';
+            document.getElementById('t' + i).value = '';
+            var bEl = document.getElementById('b' + i);
+            if (bEl) bEl.value = '';
+          });
+          GIFTS.forEach(function (g, i) {
+            var gEl = document.getElementById('g' + i);
+            if (gEl) gEl.value = '';
+          });
+          load();
+        })
+        .withFailureHandler(function (e) {
+          btn.textContent = 'Save today\'s stock'; btn.disabled = false;
+          toast('Error: ' + e.message);
+        })
+        .submitStock(p.list, p.staff, p.dateStr, p.gifts || []);
+    }
+
+    function setToday() {
+      var d = new Date();
+      var p = function (n) { return (n < 10 ? '0' : '') + n; };
+      document.getElementById('date').value =
+        d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+    }
+
+    function toast(msg) {
+      var t = document.getElementById('toast');
+      t.textContent = msg; t.classList.add('show');
+      setTimeout(function () { t.classList.remove('show'); }, 2500);
+    }
+
+    function onErr(e) {
+      document.getElementById('list').innerHTML =
+        '<div class="loading">Failed to load. Please reload the page.<br>' + esc(e.message) + '</div>';
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"]/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+      });
+    }
+
+    setToday();
+    load();
+    loadGifts();
+  </script>
+</body>
+</html>
