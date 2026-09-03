@@ -2127,6 +2127,41 @@ async def translate_text(text: str) -> str:
         return text  # caller will skip when result == original
     return result
 
+async def translate_comment_to_ja(text: str) -> str:
+    """日報のコメント欄を日本語にする。
+    スタッフは英語やタガログ語で書くため、そのままだと日報の末尾だけ
+    英語になる（2026-09-03に指摘）。translate_text は日本語を英語に
+    訳し返してしまうので、向きを日本語固定にした専用版を使う。
+    訳せなかったときは原文をそのまま返す。"""
+    if not text or not text.strip():
+        return text
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    prompt = (
+        "次の文はフィリピンにある日本食スーパーの日報のコメント欄です。"
+        "これを自然な日本語に訳してください。\n"
+        "ルール:\n"
+        "- すでに日本語ならそのまま返す\n"
+        "- 商品名・ブランド名・カテゴリー名（GrabMart, Cigarette など）はそのまま残す\n"
+        "- 金額の数字は変えない。通貨記号が無い数字には ₱ を付ける\n"
+        "- 店舗の日報らしい簡潔な文体にする。丁寧すぎる言い回しは避ける\n"
+        "- 訳文だけを返す。前置きや引用符は付けない\n\n"
+        "原文: " + text
+    )
+    try:
+        resp = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=700,
+                messages=[{"role": "user", "content": prompt}]
+            ),
+            timeout=20,
+        )
+        out = resp.content[0].text.strip()
+        return out or text
+    except Exception as e:
+        logger.warning(f"translate_comment_to_ja failed: {e}")
+        return text
+
 async def ai_chat(text: str) -> str:
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
     resp = await client.messages.create(
@@ -2933,8 +2968,9 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
 {alert_block}{cat_block}
 💡 {data['submitted_by']}さんへのコメント
 {comments}{target_line}""".strip()
-    if data.get('comment'):
-        report += f"\n\n✏️ {data['comment']}"
+    _cm = data.get('comment_ja') or data.get('comment')
+    if _cm:
+        report += f"\n\n✏️ {_cm}"
     return report
 
 # ─── Chart generators ──────────────────────────────────────
@@ -4114,6 +4150,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"generate_ai_comment error: {e}", exc_info=True)
                 comments = "（AI分析スキップ）"
+            # コメント欄は英語・タガログ語で書かれるため日本語に訳す
+            if data.get('comment'):
+                try:
+                    data['comment_ja'] = await translate_comment_to_ja(data['comment'])
+                except Exception as e:
+                    logger.error(f"comment translation error: {e}", exc_info=True)
             try:
                 daily_target   = get_daily_target(chat_id, data.get('date', ''))
                 monthly_target = get_target_any(chat_id, 'monthly')
