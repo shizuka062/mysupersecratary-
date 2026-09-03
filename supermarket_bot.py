@@ -5595,6 +5595,98 @@ def _is_tuesday_before_1st_or_3rd_wednesday() -> bool:
 
 REORDER_CHAT_ID = -4845840580
 
+LOW_STOCK_THRESHOLD = 25   # 7日分を切った商品がこの数を超えたら発注を検討する
+LOW_STOCK_DAYS = 7
+
+
+def _low_stock_items(chat_id: int) -> list:
+    """在庫が7日分を切っている商品を返す。
+    在庫がマイナスの商品は入荷が未登録で数字が信頼できないため除く。"""
+    out = []
+    for x in get_utak_reorder_list(chat_id):
+        if x.get('stock', 0) < 0:
+            continue
+        if x.get('days_left', 999) < LOW_STOCK_DAYS:
+            out.append(x)
+    out.sort(key=lambda y: y.get('days_left', 999))
+    return out
+
+
+def _low_stock_state(chat_id: int, notified: int = None) -> int:
+    """前回通知したときの品数を覚えておく。
+    毎日鳴らないようにするため、品数がしきい値を下回るまで再通知しない。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS low_stock_alert_state (
+                    chat_id INTEGER PRIMARY KEY,
+                    notified_count INTEGER,
+                    notified_at TEXT)""")
+    if notified is None:
+        c.execute("SELECT notified_count FROM low_stock_alert_state WHERE chat_id=?", (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else 0
+    c.execute("""INSERT INTO low_stock_alert_state (chat_id, notified_count, notified_at)
+                 VALUES (?,?,?)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                    notified_count=excluded.notified_count,
+                    notified_at=excluded.notified_at""",
+              (chat_id, notified, datetime.now(PHT).strftime('%Y-%m-%d %H:%M')))
+    conn.commit()
+    conn.close()
+    return notified
+
+
+async def low_stock_alert_job(context):
+    """毎日、在庫が7日分を切った商品を数えて、しきい値を超えたら通知する。
+    固定日程の発注ではなく、在庫が減ったタイミングで発注判断できるようにするため
+    （2026-09-03に静香さんの指示で追加）。"""
+    chat_id = REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
+    if not chat_id:
+        return
+    try:
+        items = _low_stock_items(chat_id)
+        n = len(items)
+        prev = _low_stock_state(chat_id)
+
+        # しきい値を下回ったら状態をリセットして、次に超えたときに通知できるようにする
+        if n < LOW_STOCK_THRESHOLD:
+            if prev:
+                _low_stock_state(chat_id, 0)
+                logger.info(f"low_stock_alert: {n}品に減ったので状態をリセット")
+            return
+        if prev:
+            logger.info(f"low_stock_alert: {n}品だが既に通知済み（前回{prev}品）")
+            return
+
+        zero = [x for x in items if x.get('stock', 0) <= 0]
+        lines = [
+            "⚠️ 発注検討のタイミングです",
+            "",
+            f"在庫が{LOW_STOCK_DAYS}日分を切った商品: {n}品",
+            f"うち在庫ゼロ: {len(zero)}品",
+            "",
+            "残りが少ない順に上位15品:",
+        ]
+        for i, x in enumerate(items[:15], 1):
+            lines.append(
+                f"{i}. {x['item_name'][:34]} — 在庫{x['stock']:.0f}個 "
+                f"({x['daily_rate']:.1f}個/日・残り{x['days_left']:.1f}日)")
+        if n > 15:
+            lines.append(f"…ほか{n-15}品")
+        lines += [
+            "",
+            "※ 数量の精査はClaudeに相談してください。",
+            f"※ この通知は{LOW_STOCK_THRESHOLD}品を超えたときに1回だけ送ります。",
+        ]
+        for chunk in _split_lines(lines):
+            await context.bot.send_message(chat_id=chat_id, text=chunk)
+        _low_stock_state(chat_id, n)
+        logger.info(f"low_stock_alert sent: {n} items")
+    except Exception as e:
+        logger.error(f"low_stock_alert_job failed: {e}", exc_info=True)
+
+
 async def auto_reorder_job(context):
     """第1・第3水曜の前日火曜に自動仕入れリストを生成・送信。
     途中で例外が出ると静かに何も届かなくなるため（2026-09-01に発生）、
@@ -5780,6 +5872,13 @@ def main():
             name='auto_reorder',
         )
         logger.info("Auto reorder scheduled: Tue 20:00 PHT before 1st/3rd Wed")
+        # 在庫が7日分を切った商品が25品を超えたら通知（毎日20:30 PHTに判定）
+        app.job_queue.run_daily(
+            low_stock_alert_job,
+            time=dtime(20, 30, tzinfo=PHT),
+            name='low_stock_alert',
+        )
+        logger.info("Low stock alert scheduled: daily 20:30 PHT (threshold 25 items under 7 days)")
         # Grab data download reminder: daily 09:00 PHT check (fires only on the 1st)
         app.job_queue.run_daily(
             grab_download_reminder_job,
