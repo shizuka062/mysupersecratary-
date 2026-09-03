@@ -421,9 +421,24 @@ def find_manager_id(name: str) -> Optional[int]:
 
 # ─── Parser ────────────────────────────────────────────────
 def _num(text: str, field: str) -> float:
-    pattern = rf'{re.escape(field)}\s*:?\s*[₱Pp]?\s*([\d,]+\.?\d*)'
+    """レポートから「項目名: 金額」を拾う。
+
+    項目名の直後に複数形の s が付いても拾う。'CASH SALE' で探していたため
+    'CASH SALES: 2,040.00' が読めず、現金がずっと0で保存されていた
+    （2026-09-03に判明。直近12日分が0だった）。
+
+    数字部分が取れても中身が空やカンマだけの場合があり、そのまま float に
+    渡すと例外でレポート全体の取り込みが止まるので、必ず検証する。"""
+    pattern = rf'{re.escape(field)}s?\s*:?\s*[₱Pp]?\s*([\d,]+\.?\d*)'
     m = re.search(pattern, text, re.IGNORECASE)
-    return float(m.group(1).replace(',', '')) if m else 0.0
+    if not m:
+        return 0.0
+    v = m.group(1).replace(',', '').strip()
+    try:
+        return float(v) if v and v != '.' else 0.0
+    except ValueError:
+        logger.warning(f"_num: could not parse {field!r} value {m.group(1)!r}")
+        return 0.0
 
 def _cat_num(text: str, field: str) -> float:
     pattern = rf'{re.escape(field)}\s*[–—-]+\s*[₱Pp]?\s*([\d,]+\.?\d*)'
