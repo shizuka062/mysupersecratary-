@@ -191,6 +191,9 @@ def init_db():
     for col, definition in [
         ('foodpanda',             'REAL DEFAULT 0'),
         ('cash_drawer',           'REAL DEFAULT 0'),
+        ('cat_cigarette',         'REAL DEFAULT 0'),
+        ('cat_onigiri',           'REAL DEFAULT 0'),
+        ('cat_canned_food',       'REAL DEFAULT 0'),
         ('cat_instant_food',      'REAL DEFAULT 0'),
         ('cat_seasoning',         'REAL DEFAULT 0'),
         ('cat_grabmart',          'REAL DEFAULT 0'),
@@ -441,9 +444,23 @@ def _num(text: str, field: str) -> float:
         return 0.0
 
 def _cat_num(text: str, field: str) -> float:
-    pattern = rf'{re.escape(field)}\s*[–—-]+\s*[₱Pp]?\s*([\d,]+\.?\d*)'
-    m = re.search(pattern, text, re.IGNORECASE)
-    return float(m.group(1).replace(',', '')) if m else 0.0
+    """レポートの「Category sales」欄から金額を取る。
+    実際の書式は空白区切り（CIGARETTE 3,200）だが、以前はダッシュを必須に
+    していたため、コメント欄の「Top 3 Categories」からしか拾えていなかった
+    （2026-09-03に16カテゴリ中2つしか出ていなくて発覚）。
+    区切りは 空白／ダッシュ／コロン のいずれも許す。"""
+    pattern = rf'^{re.escape(field)}\s*[:：–—-]?\s*[₱Pp]?\s*([\d,]+\.?\d*)\s*$'
+    m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+    if not m:
+        # 行末まででない書式（コメント欄の一覧など）にも対応
+        pattern = rf'{re.escape(field)}\s*[:：–—-]+\s*[₱Pp]?\s*([\d,]+\.?\d*)'
+        m = re.search(pattern, text, re.IGNORECASE)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1).replace(',', ''))
+    except ValueError:
+        return 0.0
 
 # ─── Target helpers ────────────────────────────────────────
 def get_target(chat_id: int, target_type: str) -> float:
@@ -1792,14 +1809,20 @@ def parse_report(text: str) -> dict:
     d['cat_chilled_item']     = _cat_num(text, 'CHILLED ITEM')
     d['cat_medicine']         = _cat_num(text, 'MEDICINE')
     d['cat_bento']            = _cat_num(text, 'BENTO')
-    d['cat_rice_noodle_bread']= _cat_num(text, 'RICE NOODLE BREAD')
+    d['cat_cigarette']        = _cat_num(text, 'CIGARETTE')
+    d['cat_onigiri']          = _cat_num(text, 'ONIGIRI')
+    d['cat_canned_food']      = _cat_num(text, 'CANNED FOOD')
+    d['cat_rice_noodle_bread']= _cat_num(text, 'RICE NOODLE')
     d['cat_grabfood']         = _cat_num(text, 'GRABFOOD')
     d['cat_rte']              = _cat_num(text, 'RTE')
     d['cat_ice_cream']        = _cat_num(text, 'ICE CREAM')
     d['cat_bath_item']        = _cat_num(text, 'BATH ITEM')
 
     # コメント欄（COMENT / COMMENT どちらも対応）
-    m_comment = re.search(r'CO[MN]{1,2}ENT\s*:?\s*(.+)', text, re.IGNORECASE)
+    # コメントは複数行でレポート末尾まで続く。re.DOTALL を付けないと
+    # 1行目しか取れない（2026-09-03に「売上サマリー」だけになって発覚）。
+    m_comment = re.search(r'CO[MN]{1,2}ENT\s*:?\s*(.+)', text,
+                          re.IGNORECASE | re.DOTALL)
     d['comment'] = m_comment.group(1).strip() if m_comment else ''
 
     return d
@@ -1842,12 +1865,13 @@ def save_record(data: dict, raw_text: str, chat_id: int):
              foodpanda, graveyard, morning, afternoon, discounts, wastage, total,
              monthly_total, cash_drawer, transaction_count, salary, inventory,
              other_expense, cashbox, for_deposit, comment,
+             cat_cigarette, cat_onigiri, cat_canned_food,
              cat_instant_food, cat_seasoning, cat_grabmart, cat_frozen_item,
              cat_personal_care, cat_beverage, cat_snacks_candies, cat_chilled_item,
              cat_medicine, cat_bento, cat_rice_noodle_bread, cat_grabfood,
              cat_rte, cat_ice_cream, cat_bath_item,
              raw_text, chat_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(date, store, chat_id) DO UPDATE SET
                 submitted_by=excluded.submitted_by,
                 cash_sale=excluded.cash_sale,
@@ -1871,6 +1895,9 @@ def save_record(data: dict, raw_text: str, chat_id: int):
                 cashbox=excluded.cashbox,
                 for_deposit=excluded.for_deposit,
                 comment=excluded.comment,
+                cat_cigarette=excluded.cat_cigarette,
+                cat_onigiri=excluded.cat_onigiri,
+                cat_canned_food=excluded.cat_canned_food,
                 cat_instant_food=excluded.cat_instant_food,
                 cat_seasoning=excluded.cat_seasoning,
                 cat_grabmart=excluded.cat_grabmart,
@@ -1897,6 +1924,8 @@ def save_record(data: dict, raw_text: str, chat_id: int):
             data['transaction_count'], data['salary'], data['inventory'],
             data['other_expense'], data['cashbox'], data['for_deposit'],
             data.get('comment', ''),
+            data.get('cat_cigarette', 0), data.get('cat_onigiri', 0),
+            data.get('cat_canned_food', 0),
             data.get('cat_instant_food', 0), data.get('cat_seasoning', 0),
             data.get('cat_grabmart', 0), data.get('cat_frozen_item', 0),
             data.get('cat_personal_care', 0), data.get('cat_beverage', 0),
@@ -2857,17 +2886,20 @@ Morning: {data['morning']/shift_total*100 if shift_total>0 else 0:.1f}% | Aftern
 
 # ─── Category labels ───────────────────────────────────────
 CAT_LABELS = [
+    ('Cigarette',         'cat_cigarette'),
+    ('Onigiri',           'cat_onigiri'),
+    ('Canned Food',       'cat_canned_food'),
     ('Instant Food',      'cat_instant_food'),
     ('Seasoning',         'cat_seasoning'),
     ('GrabMart',          'cat_grabmart'),
-    ('Frozen Item',       'cat_frozen_item'),
+    ('Frozen',            'cat_frozen_item'),
     ('Personal Care',     'cat_personal_care'),
     ('Beverage',          'cat_beverage'),
     ('Snacks & Candies',  'cat_snacks_candies'),
     ('Chilled Item',      'cat_chilled_item'),
     ('Medicine',          'cat_medicine'),
-    ('Bento',             'cat_bento'),
-    ('Rice/Noodle/Bread', 'cat_rice_noodle_bread'),
+    ('Bento Meals',       'cat_bento'),
+    ('Rice Noodle',       'cat_rice_noodle_bread'),
     ('GrabFood',          'cat_grabfood'),
     ('RTE',               'cat_rte'),
     ('Ice Cream',         'cat_ice_cream'),
@@ -3643,6 +3675,7 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               'maya','grab','foodpanda','graveyard','morning','afternoon',
               'discounts','wastage','total','monthly_total','cash_drawer',
               'transaction_count','salary','inventory','other_expense','cashbox','for_deposit',
+              'cat_cigarette','cat_onigiri','cat_canned_food',
               'cat_instant_food','cat_seasoning','cat_grabmart','cat_frozen_item',
               'cat_personal_care','cat_beverage','cat_snacks_candies','cat_chilled_item',
               'cat_medicine','cat_bento','cat_rice_noodle_bread','cat_grabfood',
