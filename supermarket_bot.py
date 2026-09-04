@@ -4383,7 +4383,7 @@ async def auto_monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
         lookup_chat = STORE_GROUP_IDS[0] if STORE_GROUP_IDS else WEEKLY_REPORT_CHAT_ID
         records, start, end = get_month_records(lookup_chat, prev_year, prev_month)
         if not records:
-            await ctx.bot.send_message(chat_id=WEEKLY_REPORT_CHAT_ID,
+            await ctx.bot.send_message(chat_id=notify_group_chat(),
                                        text=f"📭 {month_label}のデータがありません。")
             return
         total_sum     = sum(r['total'] for r in records)
@@ -4413,12 +4413,12 @@ async def auto_monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
             f"📆 営業日数: {n}日 / {days_in_month}日{target_line}\n\n"
             f"【TOP5 カテゴリ】\n{cat_rows}"
         )
-        await ctx.bot.send_message(chat_id=WEEKLY_REPORT_CHAT_ID, text=report)
+        await ctx.bot.send_message(chat_id=notify_group_chat(), text=report)
         buf = make_trend_chart(records, f"Monthly Sales Trend ({month_label})")
-        await ctx.bot.send_photo(chat_id=WEEKLY_REPORT_CHAT_ID, photo=buf, caption="📈 Monthly Trend")
+        await ctx.bot.send_photo(chat_id=notify_group_chat(), photo=buf, caption="📈 Monthly Trend")
         buf_cat = make_category_chart(records)
         if buf_cat.getbuffer().nbytes > 0:
-            await ctx.bot.send_photo(chat_id=WEEKLY_REPORT_CHAT_ID, photo=buf_cat, caption="🗂️ Category Breakdown")
+            await ctx.bot.send_photo(chat_id=notify_group_chat(), photo=buf_cat, caption="🗂️ Category Breakdown")
         logger.info(f"auto_monthly_report_job: sent {month_label} report to {WEEKLY_REPORT_CHAT_ID}")
     except Exception as e:
         logger.error(f"auto_monthly_report_job failed: {e}")
@@ -4468,7 +4468,7 @@ async def auto_weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
             logger.info(f"auto_weekly_report_job: no records for {start} - {end}, skipping")
             return
         logger.info(f"auto_weekly_report_job: sending report for {start} - {end} to {WEEKLY_REPORT_CHAT_ID}")
-        await _send_weekly_report(ctx.bot, WEEKLY_REPORT_CHAT_ID, records, label=f"先週（{start} 〜 {end}）自動レポート")
+        await _send_weekly_report(ctx.bot, notify_group_chat(), records, label=f"先週（{start} 〜 {end}）自動レポート")
     except Exception as e:
         logger.error(f"auto_weekly_report_job failed: {e}")
 
@@ -4477,10 +4477,14 @@ async def auto_procurement_job(ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(PHT)
     tomorrow = (now + timedelta(days=1)).weekday()
     today_str = now.strftime('%Y-%m-%d')
+    # WEEKLY_REPORT_CHAT_ID は2026-06-27の移行前の旧IDで、送信すると
+    # ChatMigrated で必ず失敗する（6/27以降1件も届いていなかった）。
+    # この提案はインラインボタンの状態を chat_id で保持しているため
+    # （_pending_proposals[chat_id]）、送信先だけ新IDへ読み替えると
+    # ボタンの押下先とキーがずれて動かない。
+    # 仕入れの相談はClaudeと行うので、静香さんのDMだけに送る（2026-09-04の指示）。
     target_chats = []
-    if WEEKLY_REPORT_CHAT_ID:
-        target_chats.append(WEEKLY_REPORT_CHAT_ID)
-    if OWNER_CHAT_ID and OWNER_CHAT_ID not in target_chats:
+    if OWNER_CHAT_ID:
         target_chats.append(OWNER_CHAT_ID)
     for chat_id in target_chats:
         try:
@@ -5179,8 +5183,9 @@ async def utak_auto_sync(context):
     if not UTAK_EMAIL or not UTAK_PASSWORD:
         logger.info("UTAK credentials not set — skipping auto-sync")
         return
-    chat_id = REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
-    if not chat_id:
+    chat_id = DATA_CHAT_ID or WEEKLY_REPORT_CHAT_ID   # データ参照用
+    notify = notify_owner_chat()                       # 送信先（静香さんのDM）
+    if not chat_id or not notify:
         logger.warning("No chat_id for UTAK sync notification")
         return
     logger.info("UTAK auto-sync starting...")
@@ -5320,12 +5325,12 @@ async def utak_auto_sync(context):
         now = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
         # Send sync status
         sync_msg = f"🔄 UTAK Auto-Sync Complete ({now})\n" + "\n".join(results)
-        await context.bot.send_message(chat_id=chat_id, text=sync_msg)
+        await context.bot.send_message(chat_id=notify, text=sync_msg)
 
         # Send daily sales report
         yesterday = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
         daily_report = get_daily_sales_report(chat_id, yesterday)
-        await context.bot.send_message(chat_id=chat_id, text=daily_report)
+        await context.bot.send_message(chat_id=notify, text=daily_report)
 
         # Send stock alerts (only selling items)
         reorder = get_utak_reorder_list(chat_id)
@@ -5342,11 +5347,11 @@ async def utak_auto_sync(context):
                 alert += f"\n\n🟡 WARNING — restock within 7 days: {len(warning)} items"
                 for it in warning[:8]:
                     alert += f"\n  • {it['item_name']}: {it['stock']:.0f} left ({it['days_left']:.1f}d)"
-            await context.bot.send_message(chat_id=chat_id, text=alert)
+            await context.bot.send_message(chat_id=notify, text=alert)
     except Exception as e:
         logger.error(f"UTAK auto-sync failed: {e}")
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ UTAK自動同期エラー: {e}")
+            await context.bot.send_message(chat_id=notify, text=f"❌ UTAK自動同期エラー: {e}")
         except Exception:
             pass
 
@@ -5639,7 +5644,25 @@ def _is_tuesday_before_1st_or_3rd_wednesday() -> bool:
     week_num = (wednesday.day - 1) // 7 + 1
     return week_num in (1, 3)
 
-REORDER_CHAT_ID = -4845840580
+# DBのキー。utak_sales / utak_inventory はこのIDで保存されているため変更不可。
+# グループ自体は2026-06-27にスーパーグループへ移行してIDが変わっているので、
+# 「データの参照先」と「通知の送信先」は別物として扱う。
+REORDER_CHAT_ID = -4845840580          # ＝データ参照用（DATA_CHAT_ID）
+DATA_CHAT_ID = -4845840580
+# 移行後のManager's GC。旧IDへ送ると ChatMigrated で失敗する
+# （6/27以降、定期ジョブの通知が1件も届いていなかった原因）
+GROUP_CHAT_ID = -1004418896841
+
+
+def notify_owner_chat() -> int:
+    """静香さん個人への通知先。発注の相談はClaudeと行うため、
+    発注関連の通知はグループに出さず個人に送る（2026-09-04の指示）。"""
+    return OWNER_CHAT_ID or GROUP_CHAT_ID
+
+
+def notify_group_chat() -> int:
+    """スタッフも見るグループへの通知先（週次・月次レポートなど）。"""
+    return GROUP_CHAT_ID or OWNER_CHAT_ID
 
 LOW_STOCK_THRESHOLD = 25   # 7日分を切った商品がこの数を超えたら発注を検討する
 LOW_STOCK_DAYS = 7
@@ -5687,8 +5710,9 @@ async def low_stock_alert_job(context):
     """毎日、在庫が7日分を切った商品を数えて、しきい値を超えたら通知する。
     固定日程の発注ではなく、在庫が減ったタイミングで発注判断できるようにするため
     （2026-09-03に静香さんの指示で追加）。"""
-    chat_id = REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
-    if not chat_id:
+    chat_id = DATA_CHAT_ID or WEEKLY_REPORT_CHAT_ID   # データ参照用
+    notify = notify_owner_chat()                       # 送信先（静香さんのDM）
+    if not chat_id or not notify:
         return
     try:
         items = _low_stock_items(chat_id)
@@ -5726,7 +5750,7 @@ async def low_stock_alert_job(context):
             f"※ この通知は{LOW_STOCK_THRESHOLD}品を超えたときに1回だけ送ります。",
         ]
         for chunk in _split_lines(lines):
-            await context.bot.send_message(chat_id=chat_id, text=chunk)
+            await context.bot.send_message(chat_id=notify, text=chunk)
         _low_stock_state(chat_id, n)
         logger.info(f"low_stock_alert sent: {n} items")
     except Exception as e:
@@ -5743,7 +5767,7 @@ async def auto_reorder_job(context):
         logger.error(f"auto_reorder_job failed: {e}", exc_info=True)
         try:
             await context.bot.send_message(
-                chat_id=REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID,
+                chat_id=notify_owner_chat(),
                 text=f"❌ 発注リストの自動生成に失敗しました\n{type(e).__name__}: {e}\n\n"
                      "「在庫分析」で手動生成できます。")
         except Exception:
@@ -5752,8 +5776,9 @@ async def auto_reorder_job(context):
 async def _auto_reorder_job_inner(context):
     if not _is_tuesday_before_1st_or_3rd_wednesday():
         return
-    chat_id = REORDER_CHAT_ID
-    if not chat_id:
+    chat_id = DATA_CHAT_ID              # データ参照用
+    notify = notify_owner_chat()        # 送信先（静香さんのDM）
+    if not chat_id or not notify:
         return
     logger.info("Auto reorder: generating procurement list...")
     # ここで utak_auto_sync を呼ばない。
@@ -5763,7 +5788,7 @@ async def _auto_reorder_job_inner(context):
     # 在庫・売上は1時の同期で十分新しい。
     reorder = get_utak_reorder_list(chat_id)
     if not reorder:
-        await context.bot.send_message(chat_id=chat_id, text="📋 仕入れリスト自動生成: UTAKデータが不足しています。")
+        await context.bot.send_message(chat_id=notify, text="📋 仕入れリスト自動生成: UTAKデータが不足しています。")
         return
     # Build message (English for manager)
     now = datetime.now(PHT)
@@ -5815,7 +5840,7 @@ async def _auto_reorder_job_inner(context):
     # 行の途中で切れると読みづらいので、行単位で詰めて分割する。
     for _chunk in _split_lines(lines):
         try:
-            await context.bot.send_message(chat_id=chat_id, text=_chunk)
+            await context.bot.send_message(chat_id=notify, text=_chunk)
         except Exception as e:
             logger.error(f"Auto reorder: message send failed: {e}")
     # CSV (English headers)
@@ -5842,7 +5867,7 @@ async def _auto_reorder_job_inner(context):
     csv_bytes = csv_buf.getvalue().encode('utf-8-sig')
     date_str = tomorrow.strftime('%Y%m%d')
     await context.bot.send_document(
-        chat_id=chat_id,
+        chat_id=notify,
         document=io.BytesIO(csv_bytes),
         filename=f"reorder_{date_str}.csv",
         caption=f"📋 Reorder List CSV ({ordinal} Wed {tomorrow.strftime('%m/%d')})"
