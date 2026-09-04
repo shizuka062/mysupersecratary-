@@ -194,6 +194,18 @@ def init_db():
         ('cat_cigarette',         'REAL DEFAULT 0'),
         ('cat_onigiri',           'REAL DEFAULT 0'),
         ('cat_canned_food',       'REAL DEFAULT 0'),
+        ('cat_add_ons',             'REAL DEFAULT 0'),
+        ('cat_vegetable',           'REAL DEFAULT 0'),
+        ('cat_adult',               'REAL DEFAULT 0'),
+        ('cat_cleaning_item',       'REAL DEFAULT 0'),
+        ('cat_oral_care',           'REAL DEFAULT 0'),
+        ('cat_dhc',                 'REAL DEFAULT 0'),
+        ('cat_tissue_paper',        'REAL DEFAULT 0'),
+        ('cat_fruits',              'REAL DEFAULT 0'),
+        ('cat_pet_product',         'REAL DEFAULT 0'),
+        ('cat_baby_essential',      'REAL DEFAULT 0'),
+        ('cat_kitchen_item',        'REAL DEFAULT 0'),
+        ('cat_others',              'REAL DEFAULT 0'),
         ('cat_instant_food',      'REAL DEFAULT 0'),
         ('cat_seasoning',         'REAL DEFAULT 0'),
         ('cat_grabmart',          'REAL DEFAULT 0'),
@@ -1830,6 +1842,18 @@ def parse_report(text: str) -> dict:
     d['cat_rte']              = _cat_num(text, 'RTE')
     d['cat_ice_cream']        = _cat_num(text, 'ICE CREAM')
     d['cat_bath_item']        = _cat_num(text, 'BATH ITEM')
+    d['cat_add_ons']                = _cat_num(text, 'ADD ONS', 'ADD-ONS', 'ADDONS')
+    d['cat_vegetable']              = _cat_num(text, 'VEGETABLE', 'VEGETABLES')
+    d['cat_adult']                  = _cat_num(text, 'ADULT')
+    d['cat_cleaning_item']          = _cat_num(text, 'CLEANING ITEM', 'CLEANING ITEMS', 'CLEANING')
+    d['cat_oral_care']              = _cat_num(text, 'ORAL CARE')
+    d['cat_dhc']                    = _cat_num(text, 'DHC SUPPLEMENT', 'DHC SUPPLEMENTS', 'DHC')
+    d['cat_tissue_paper']           = _cat_num(text, 'TISSUE & PAPERS', 'TISSUE AND PAPERS', 'TISSUE&PAPER', 'TISSUE PAPER', 'TISSUE PAPERS', 'TISSUE & PAPER')
+    d['cat_fruits']                 = _cat_num(text, 'FRUITS', 'FRUIT')
+    d['cat_pet_product']            = _cat_num(text, 'PET PRODUCT', 'PET PRODUCTS')
+    d['cat_baby_essential']         = _cat_num(text, 'BABY ESSENTIALS', 'BABY ESSENTIAL')
+    d['cat_kitchen_item']           = _cat_num(text, 'KITCHEN ITEM', 'KITCHEN ITEMS')
+    d['cat_others']                 = _cat_num(text, 'OTHERS')
 
     # コメント欄（COMENT / COMMENT どちらも対応）
     # コメントは複数行でレポート末尾まで続く。re.DOTALL を付けないと
@@ -1883,8 +1907,9 @@ def save_record(data: dict, raw_text: str, chat_id: int):
              cat_personal_care, cat_beverage, cat_snacks_candies, cat_chilled_item,
              cat_medicine, cat_bento, cat_rice_noodle_bread, cat_grabfood,
              cat_rte, cat_ice_cream, cat_bath_item,
+             cat_add_ons, cat_vegetable, cat_adult, cat_cleaning_item, cat_oral_care, cat_dhc, cat_tissue_paper, cat_fruits, cat_pet_product, cat_baby_essential, cat_kitchen_item, cat_others,
              raw_text, chat_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(date, store, chat_id) DO UPDATE SET
                 submitted_by=excluded.submitted_by,
                 cash_sale=excluded.cash_sale,
@@ -1926,6 +1951,18 @@ def save_record(data: dict, raw_text: str, chat_id: int):
                 cat_rte=excluded.cat_rte,
                 cat_ice_cream=excluded.cat_ice_cream,
                 cat_bath_item=excluded.cat_bath_item,
+                cat_add_ons=excluded.cat_add_ons,
+                cat_vegetable=excluded.cat_vegetable,
+                cat_adult=excluded.cat_adult,
+                cat_cleaning_item=excluded.cat_cleaning_item,
+                cat_oral_care=excluded.cat_oral_care,
+                cat_dhc=excluded.cat_dhc,
+                cat_tissue_paper=excluded.cat_tissue_paper,
+                cat_fruits=excluded.cat_fruits,
+                cat_pet_product=excluded.cat_pet_product,
+                cat_baby_essential=excluded.cat_baby_essential,
+                cat_kitchen_item=excluded.cat_kitchen_item,
+                cat_others=excluded.cat_others,
                 raw_text=excluded.raw_text,
                 created_at=CURRENT_TIMESTAMP
         ''', (
@@ -1947,6 +1984,18 @@ def save_record(data: dict, raw_text: str, chat_id: int):
             data.get('cat_rice_noodle_bread', 0), data.get('cat_grabfood', 0),
             data.get('cat_rte', 0), data.get('cat_ice_cream', 0),
             data.get('cat_bath_item', 0),
+            data.get('cat_add_ons', 0),
+            data.get('cat_vegetable', 0),
+            data.get('cat_adult', 0),
+            data.get('cat_cleaning_item', 0),
+            data.get('cat_oral_care', 0),
+            data.get('cat_dhc', 0),
+            data.get('cat_tissue_paper', 0),
+            data.get('cat_fruits', 0),
+            data.get('cat_pet_product', 0),
+            data.get('cat_baby_essential', 0),
+            data.get('cat_kitchen_item', 0),
+            data.get('cat_others', 0),
             raw_text, chat_id
         ))
         conn.commit()
@@ -2917,6 +2966,18 @@ CAT_LABELS = [
     ('RTE',               'cat_rte'),
     ('Ice Cream',         'cat_ice_cream'),
     ('Bath Item',         'cat_bath_item'),
+    ('Add Ons',            'cat_add_ons'),
+    ('Vegetable',          'cat_vegetable'),
+    ('Adult',              'cat_adult'),
+    ('Cleaning Item',      'cat_cleaning_item'),
+    ('Oral Care',          'cat_oral_care'),
+    ('DHC Supplement',     'cat_dhc'),
+    ('Tissue & Papers',    'cat_tissue_paper'),
+    ('Fruits',             'cat_fruits'),
+    ('Pet Product',        'cat_pet_product'),
+    ('Baby Essentials',    'cat_baby_essential'),
+    ('Kitchen Item',       'cat_kitchen_item'),
+    ('Others',             'cat_others'),
 ]
 
 # ─── Format daily report ───────────────────────────────────
@@ -3692,7 +3753,8 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               'cat_instant_food','cat_seasoning','cat_grabmart','cat_frozen_item',
               'cat_personal_care','cat_beverage','cat_snacks_candies','cat_chilled_item',
               'cat_medicine','cat_bento','cat_rice_noodle_bread','cat_grabfood',
-              'cat_rte','cat_ice_cream','cat_bath_item']
+              'cat_rte','cat_ice_cream','cat_bath_item',
+              'cat_add_ons','cat_vegetable','cat_adult','cat_cleaning_item','cat_oral_care','cat_dhc','cat_tissue_paper','cat_fruits','cat_pet_product','cat_baby_essential','cat_kitchen_item','cat_others']
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
