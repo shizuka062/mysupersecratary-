@@ -443,7 +443,20 @@ def _num(text: str, field: str) -> float:
         logger.warning(f"_num: could not parse {field!r} value {m.group(1)!r}")
         return 0.0
 
-def _cat_num(text: str, field: str) -> float:
+def _cat_num(text: str, field, *more) -> float:
+    """ラベルは日によって書き方が変わるため、候補を複数渡せる。
+    例: FROZEN ITEM と Frozen、BENTO MEALS と BENTO。
+    最初に見つかった金額を返す。"""
+    names = [field] if isinstance(field, str) else list(field)
+    names += list(more)
+    for nm in names:
+        v = _cat_num_one(text, nm)
+        if v:
+            return v
+    return 0.0
+
+
+def _cat_num_one(text: str, field: str) -> float:
     """レポートの「Category sales」欄から金額を取る。
     実際の書式は空白区切り（CIGARETTE 3,200）だが、以前はダッシュを必須に
     していたため、コメント欄の「Top 3 Categories」からしか拾えていなかった
@@ -1801,19 +1814,19 @@ def parse_report(text: str) -> dict:
 
     d['cat_instant_food']     = _cat_num(text, 'INSTANT FOOD')
     d['cat_seasoning']        = _cat_num(text, 'SEASONING')
-    d['cat_grabmart']         = _cat_num(text, 'GRABMART')
-    d['cat_frozen_item']      = _cat_num(text, 'FROZEN ITEM')
+    d['cat_grabmart']         = _cat_num(text, 'GRABMART', 'GRAB MART')
+    d['cat_frozen_item']      = _cat_num(text, 'FROZEN ITEM', 'FROZEN')
     d['cat_personal_care']    = _cat_num(text, 'PERSONAL CARE')
     d['cat_beverage']         = _cat_num(text, 'BEVERAGE')
-    d['cat_snacks_candies']   = _cat_num(text, 'SNACKS & CANDIES')
+    d['cat_snacks_candies']   = _cat_num(text, 'SNACKS & CANDIES', 'SNACKS AND CANDIES', 'SNACKS')
     d['cat_chilled_item']     = _cat_num(text, 'CHILLED ITEM')
     d['cat_medicine']         = _cat_num(text, 'MEDICINE')
-    d['cat_bento']            = _cat_num(text, 'BENTO')
+    d['cat_bento']            = _cat_num(text, 'BENTO MEALS', 'BENTO')
     d['cat_cigarette']        = _cat_num(text, 'CIGARETTE')
     d['cat_onigiri']          = _cat_num(text, 'ONIGIRI')
     d['cat_canned_food']      = _cat_num(text, 'CANNED FOOD')
-    d['cat_rice_noodle_bread']= _cat_num(text, 'RICE NOODLE')
-    d['cat_grabfood']         = _cat_num(text, 'GRABFOOD')
+    d['cat_rice_noodle_bread']= _cat_num(text, 'RICE NOODLE BREAD', 'RICE NOODLE')
+    d['cat_grabfood']         = _cat_num(text, 'GRABFOOD', 'GRAB FOOD')
     d['cat_rte']              = _cat_num(text, 'RTE')
     d['cat_ice_cream']        = _cat_num(text, 'ICE CREAM')
     d['cat_bath_item']        = _cat_num(text, 'BATH ITEM')
